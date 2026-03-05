@@ -1,0 +1,26 @@
+# AI 쇼츠 제작기 - Python 패키지 목록
+# 설치: pip install -r requirements.txt
+
+# 웹 서버
+fastapi==0.115.0
+uvicorn[standard]==0.30.0
+python-multipart==0.0.9
+
+# AI API
+anthropic==0.34.0
+
+# TTS (무료)
+edge-tts==6.1.10
+
+# 영상 처리
+moviepy==1.0.3
+ffmpeg-python==0.2.0
+
+# 이미지 처리 (썸네일)
+Pillow==10.4.0
+
+# 오디오 메타데이터
+mutagen==1.47.0
+
+# 환경변수
+python-dotenv==1.0.1
