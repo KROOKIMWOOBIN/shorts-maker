@@ -32,7 +32,7 @@ import java.util.concurrent.*;
 public class ShortsGenerationService {
 
     private final ScriptService    scriptService;
-    private final EdgeTtsService   ttsService;
+    private final TtsService ttsService;
     private final ThumbnailService thumbnailService;
     private final VideoService     videoService;
 

@@ -18,7 +18,7 @@ import java.nio.file.*;
  */
 @Slf4j
 @Service
-public class EdgeTtsService {
+public class TtsService {
 
     // piper 바이너리 및 모델 경로 (프로젝트 루트 기준)
     private static final String PIPER_DIR        = "piper";

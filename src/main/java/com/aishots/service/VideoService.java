@@ -18,7 +18,6 @@ import java.nio.file.Paths;
 import java.util.*;
 import java.util.List;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * 영상 합성 서비스 — v3 고성능 버전
@@ -47,10 +46,10 @@ public class VideoService {
     // ⑪ 파이프라인 큐 용량
     private static final int QUEUE_CAPACITY = 32;
 
-    private final EdgeTtsService     ttsService;
+    private final TtsService ttsService;
     private final VideoRenderProfile profile;  // ⑨ 하드웨어 프로파일
 
-    public VideoService(EdgeTtsService ttsService, VideoRenderProfile profile) {
+    public VideoService(TtsService ttsService, VideoRenderProfile profile) {
         this.ttsService = ttsService;
         this.profile    = profile;
         avutil.av_log_set_level(avutil.AV_LOG_ERROR);
