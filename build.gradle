@@ -1,0 +1,88 @@
+plugins {
+    id 'java'
+    id 'org.springframework.boot' version '3.2.0'
+    id 'io.spring.dependency-management' version '1.1.4'
+    id 'war'
+}
+
+group   = 'com.aishots'
+version = '1.0.0'
+sourceCompatibility = '17'
+
+configurations {
+    compileOnly { extendsFrom annotationProcessor }
+}
+
+repositories {
+    mavenCentral()
+}
+
+// ── OS 자동 감지 ────────────────────────────────────────────────────
+// javacv-platform (전 플랫폼 ~1.5GB) → OS별 단일 바이너리 (~300MB)로 교체
+def osName = System.getProperty('os.name').toLowerCase()
+def osArch = System.getProperty('os.arch').toLowerCase()
+
+def javacvPlatform = {
+    if (osName.contains('windows'))   return 'windows-x86_64'
+    if (osName.contains('mac')) {
+        return osArch.contains('aarch64') ? 'macosx-arm64' : 'macosx-x86_64'
+    }
+    // Linux
+    return osArch.contains('aarch64') ? 'linux-arm64' : 'linux-x86_64'
+}()
+
+logger.lifecycle("▶ 빌드 플랫폼: ${javacvPlatform}")
+
+def javacvVersion = '1.5.10'
+
+dependencies {
+    // ── Spring Boot ──────────────────────────────────────────────
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation 'org.springframework.boot:spring-boot-starter-validation'
+    implementation 'org.springframework.boot:spring-boot-starter-webflux'
+
+    // ── JSP ─────────────────────────────────────────────────────
+    implementation 'org.apache.tomcat.embed:tomcat-embed-jasper'
+    implementation 'jakarta.servlet.jsp.jstl:jakarta.servlet.jsp.jstl-api:3.0.0'
+    implementation 'org.glassfish.web:jakarta.servlet.jsp.jstl:3.0.1'
+
+    // ── JavaCV — OS별 플랫폼 바이너리만 포함 (~300MB, 기존 ~1.5GB) ──
+    implementation "org.bytedeco:javacv:${javacvVersion}"
+    implementation "org.bytedeco:ffmpeg:6.1.1-${javacvVersion}:${javacvPlatform}"
+    implementation "org.bytedeco:ffmpeg-platform:6.1.1-${javacvVersion}"
+
+    // ── Edge TTS WebSocket ───────────────────────────────────────
+    implementation 'org.java-websocket:Java-WebSocket:1.5.6'
+
+    // ── MP3 길이 추출 ────────────────────────────────────────────
+    implementation 'net.jthink:jaudiotagger:3.0.1'
+
+    // ── JSON ─────────────────────────────────────────────────────
+    implementation 'com.fasterxml.jackson.core:jackson-databind'
+
+    // ── 유틸 ─────────────────────────────────────────────────────
+    compileOnly    'org.projectlombok:lombok'
+    annotationProcessor 'org.projectlombok:lombok'
+
+    // ── Test ─────────────────────────────────────────────────────
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    providedRuntime    'org.springframework.boot:spring-boot-starter-tomcat'
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+}
+
+// JVM 최적화 옵션 (저사양 환경)
+bootRun {
+    jvmArgs = [
+        '-Xms256m',            // 초기 힙 256MB
+        '-Xmx1g',              // 최대 힙 1GB (저사양 기준)
+        '-XX:+UseG1GC',        // G1GC: 짧은 pause, 대용량 힙에 적합
+        '-XX:MaxGCPauseMillis=200',
+        '-XX:+UseStringDeduplication',
+        '-Djava.awt.headless=true',  // 헤드리스 모드 (서버 환경)
+        '-Dawt.useSystemAAFontSettings=lcd',
+        '-Dswing.aatext=true',
+    ]
+}
