@@ -41,21 +41,21 @@ public class ScriptService {
         int wordCount = durationSeconds * 3;
 
         String prompt = String.format("""
-                당신은 유튜브 쇼츠 전문 스크립트 작가입니다.
-                다음 주제로 %d초 분량의 쇼츠 스크립트를 작성해주세요.
-
-                주제: %s
-                톤: %s
-                목표 단어 수: 약 %d자 (한국어 기준)
-
-                반드시 아래 JSON 형식으로만 응답하세요. 다른 텍스트는 포함하지 마세요:
-
+                You are a professional YouTube Shorts script writer.
+                Write a %d-second shorts script on the following topic.
+        
+                Topic: %s
+                Tone: %s
+                Target word count: approximately %d words
+        
+                Respond ONLY in the following JSON format. Do not include any other text:
+        
                 {
-                    "title": "클릭을 유도하는 흥미로운 영상 제목 (30자 이내)",
-                    "hook": "처음 3초 안에 시청자를 사로잡는 강렬한 첫 문장 (1-2문장)",
-                    "script": "전체 나레이션 스크립트. 자연스럽게 말하는 것처럼 작성.",
-                    "hashtags": ["#관련태그1", "#관련태그2", "#관련태그3", "#관련태그4", "#관련태그5"],
-                    "thumbnailPrompt": "썸네일 이미지 생성을 위한 영어 프롬프트"
+                    "title": "An engaging video title that drives clicks (under 60 chars)",
+                    "hook": "A powerful opening line that grabs viewers in the first 3 seconds (1-2 sentences)",
+                    "script": "Full narration script. Write as if speaking naturally.",
+                    "hashtags": ["#tag1", "#tag2", "#tag3", "#tag4", "#tag5"],
+                    "thumbnailPrompt": "English prompt for thumbnail image generation"
                 }
                 """, durationSeconds, topic, tone, wordCount);
 

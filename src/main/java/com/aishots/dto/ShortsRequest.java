@@ -38,10 +38,10 @@ public class ShortsRequest {
     private int durationSeconds = 60;
 
     @NotBlank(message = "말투를 선택해주세요.")
-    private String tone = "친근하고 흥미롭게";
+    private String tone = "friendly and engaging";
 
     @NotBlank(message = "음성을 선택해주세요.")
-    private String voice = "여성_기본";
+    private String voice = "en_US";
 
     @NotNull(message = "배경색을 선택해주세요.")
     @Size(min = 3, max = 3, message = "배경색은 RGB 3개 값이어야 합니다.")

@@ -18,283 +18,392 @@ import java.nio.file.Paths;
 import java.util.*;
 import java.util.List;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * 영상 합성 서비스 — v3 고성능 버전
+ * 영상 합성 서비스 — 파티클 배경 + 자막 타이밍 + 오디오 노이즈 수정
  *
- * 추가 최적화:
- * ⑨  VideoRenderProfile 자동 연동 — 하드웨어에 맞는 preset/crf/fps 자동 선택
- * ⑩  그라데이션 배경 지원 — 단색 대비 퀄리티 향상 (배경도 1회만 렌더링)
- * ⑪  BlockingQueue 기반 프레임 파이프라인 — recorder 경합(synchronized) 완전 제거
- * ⑫  자막 청크 정규화 — 빈 문자열/null 통일로 캐시 히트율 100% 보장
- * ⑬  GC 압박 최소화 — 캐시 크기 제한(최대 200항목) + LRU 없이 완료 후 일괄 해제
+ * 변경 사항:
+ * ① 파티클 애니메이션 배경 — 프레임마다 파티클 위치 업데이트
+ * ② 자막 타이밍 수정 — 단어 수 기반 가중 타이밍 (균등 분할 제거)
+ * ③ 오디오 노이즈 수정 — 44100Hz 통일, 오디오 먼저 삽입 후 비디오
+ * ④ 자막 캐시 제거 — 파티클이 매 프레임 다르므로 캐시 불가
  */
 @Slf4j
 @Service
 public class VideoService {
 
-    private static final int WIDTH            = 1080;
-    private static final int HEIGHT           = 1920;
-    private static final int CHUNK_SIZE       = 4;
-    private static final float SUBTITLE_Y     = 0.72f;
-    private static final int   FONT_SIZE      = 72;
-    private static final float OUTLINE_WIDTH  = 5f;
+    private static final int   WIDTH         = 1080;
+    private static final int   HEIGHT        = 1920;
+    private static final int   CHUNK_SIZE    = 4;
+    private static final float SUBTITLE_Y    = 0.78f;
+    private static final int   FONT_SIZE     = 72;
+    private static final float OUTLINE_WIDTH = 5f;
+    private static final int   SAMPLE_RATE   = 44100; // ③ 리샘플링과 통일
 
-    // ② 폰트 static 캐시
+    // 파티클 설정
+    private static final int   PARTICLE_COUNT      = 80;
+    private static final float PARTICLE_SPEED_MIN  = 0.3f;
+    private static final float PARTICLE_SPEED_MAX  = 1.2f;
+    private static final int   PARTICLE_SIZE_MIN   = 3;
+    private static final int   PARTICLE_SIZE_MAX   = 12;
+
     private static final Font CACHED_FONT = resolveKoreanFont(FONT_SIZE);
 
-    // ⑪ 파이프라인 큐 용량
-    private static final int QUEUE_CAPACITY = 32;
-
-    private final TtsService ttsService;
-    private final VideoRenderProfile profile;  // ⑨ 하드웨어 프로파일
+    private final TtsService     ttsService;
+    private final VideoRenderProfile profile;
 
     public VideoService(TtsService ttsService, VideoRenderProfile profile) {
         this.ttsService = ttsService;
         this.profile    = profile;
         avutil.av_log_set_level(avutil.AV_LOG_ERROR);
-        log.info("VideoService 준비 — 프로파일: {} / 폰트: {}", profile.getProfile(), CACHED_FONT.getFontName());
+        log.info("VideoService 준비 — 프로파일: {} / 폰트: {}",
+                profile.getProfile(), CACHED_FONT.getFontName());
     }
 
-    // ─────────────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────
+    //  파티클 데이터 클래스
+    // ─────────────────────────────────────────────────────────────
+
+    private static class Particle {
+        float x, y;        // 현재 위치
+        float vx, vy;      // 속도
+        int   size;        // 크기
+        float alpha;       // 투명도
+        float alphaDelta;  // 투명도 변화량 (반짝임)
+        Color color;       // 색상
+
+        Particle(Random rnd, int[] accentColor) {
+            x     = rnd.nextFloat() * WIDTH;
+            y     = rnd.nextFloat() * HEIGHT;
+            float speed = PARTICLE_SPEED_MIN + rnd.nextFloat() * (PARTICLE_SPEED_MAX - PARTICLE_SPEED_MIN);
+            float angle = rnd.nextFloat() * (float)(Math.PI * 2);
+            vx    = (float)(Math.cos(angle) * speed);
+            vy    = (float)(Math.sin(angle) * speed) - 0.4f; // 위로 살짝 편향
+            size  = PARTICLE_SIZE_MIN + rnd.nextInt(PARTICLE_SIZE_MAX - PARTICLE_SIZE_MIN);
+            alpha = 0.1f + rnd.nextFloat() * 0.5f;
+            alphaDelta = (rnd.nextBoolean() ? 1 : -1) * (0.002f + rnd.nextFloat() * 0.005f);
+            // 강조색 기반 + 흰색 혼합
+            if (rnd.nextFloat() < 0.6f) {
+                color = new Color(accentColor[0], accentColor[1], accentColor[2]);
+            } else {
+                color = Color.WHITE;
+            }
+        }
+
+        void update() {
+            x += vx;
+            y += vy;
+            alpha += alphaDelta;
+            // 경계 처리: 화면 밖으로 나가면 반대편에서 등장
+            if (x < 0)      x = WIDTH;
+            if (x > WIDTH)  x = 0;
+            if (y < 0)      y = HEIGHT;
+            if (y > HEIGHT) y = 0;
+            // 투명도 반전
+            if (alpha > 0.7f || alpha < 0.05f) alphaDelta = -alphaDelta;
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    //  PUBLIC
+    // ─────────────────────────────────────────────────────────────
+
     public String createShortsVideo(
             String audioPath, String script,
             int bgR, int bgG, int bgB, String filename) throws Exception {
 
-        Files.createDirectories(Paths.get(profile.getProfile().name().toLowerCase()));
-        String videoDir  = "outputs/videos";
+        String videoDir = "outputs/videos";
         Files.createDirectories(Paths.get(videoDir));
         String outputPath = videoDir + "/" + filename + ".mp4";
 
         double duration    = ttsService.getAudioDuration(audioPath);
         int    fps         = profile.getFps();
-        long   totalFrames = (long) (duration * fps);
+        long   totalFrames = (long)(duration * fps);
 
-        log.info("[{}] 시작 — {:.1f}s / {}프레임 / {}fps / 프로파일:{}",
-                filename, duration, totalFrames, fps, profile.getProfile());
+        log.info("[{}] 시작 — {:.1f}s / {}프레임 / {}fps",
+                filename, duration, totalFrames, fps);
 
+        // ② 단어 수 기반 가중 자막 타이밍
         List<String> chunks      = buildSubtitleChunks(script);
-        double       timePerChunk = duration / Math.max(chunks.size(), 1);
+        double[]     chunkTimes  = buildChunkTimings(chunks, duration);
 
-        // ⑩ 배경 1회 렌더링 (그라데이션 or 단색)
-        BufferedImage bgLayer = renderBackground(bgR, bgG, bgB);
+        // 강조색 (배경색에서 보색 계산)
+        int[] accent = computeAccentColor(bgR, bgG, bgB);
 
-        // ⑫ 자막 캐시 (정규화된 키 사용)
-        Map<String, byte[]> subtitleCache = new ConcurrentHashMap<>();
+        // 파티클 초기화
+        Random   rnd       = new Random(42); // 시드 고정 → 재현 가능
+        Particle[] particles = new Particle[PARTICLE_COUNT];
+        for (int i = 0; i < PARTICLE_COUNT; i++)
+            particles[i] = new Particle(rnd, accent);
 
         FFmpegFrameRecorder recorder = buildRecorder(outputPath, fps);
-
         try {
             recorder.start();
 
-            // ⑪ BlockingQueue 파이프라인
-            // 렌더 스레드 → queue → 인코딩 스레드(메인)
-            BlockingQueue<Object[]> frameQueue = new ArrayBlockingQueue<>(QUEUE_CAPACITY);
-            Object[] POISON = new Object[0]; // 종료 신호
+            // ③ 오디오 먼저 삽입 (타임스탬프 기준점 확립)
+            injectAudio(recorder, audioPath);
 
-            // 오디오 Future
-            ExecutorService ioExec = Executors.newFixedThreadPool(2, r -> {
-                Thread t = new Thread(r, "av-io"); t.setDaemon(true); return t;
-            });
-
-            Future<?> audioFuture = ioExec.submit(() -> injectAudio(recorder, audioPath));
-
-            // 렌더 producer (N workers → 단일 큐)
-            int workers = profile.getRenderWorkers();
-            ExecutorService renderPool = Executors.newFixedThreadPool(workers, r -> {
-                Thread t = new Thread(r, "frame-render"); t.setDaemon(true); return t;
-            });
-
-            // 프레임 인덱스 분배용 AtomicLong
-            java.util.concurrent.atomic.AtomicLong frameCounter = new java.util.concurrent.atomic.AtomicLong(0);
-            CountDownLatch renderLatch = new CountDownLatch(workers);
-
-            // 스레드별 전용 버퍼
-            BufferedImage[] bufs = new BufferedImage[workers];
-            for (int i = 0; i < workers; i++)
-                bufs[i] = new BufferedImage(WIDTH, HEIGHT, BufferedImage.TYPE_3BYTE_BGR);
-
-            for (int w = 0; w < workers; w++) {
-                final int workerIdx = w;
-                renderPool.submit(() -> {
-                    try {
-                        while (true) {
-                            long fIdx = frameCounter.getAndIncrement();
-                            if (fIdx >= totalFrames) break;
-
-                            String subtitle = getSubtitle(chunks, fIdx, fps, timePerChunk);
-                            byte[] px = renderFrameBytes(bgLayer, bufs[workerIdx], subtitle, subtitleCache);
-
-                            // ⑪ 순서 보장을 위해 (fIdx, px) 쌍으로 큐에 삽입
-                            frameQueue.put(new Object[]{fIdx, px, bufs[workerIdx]});
-                        }
-                    } catch (Exception e) {
-                        log.error("렌더 오류: {}", e.getMessage());
-                    } finally {
-                        renderLatch.countDown();
-                    }
-                });
-            }
-
-            // 종료 신호 전송용 감시 스레드
-            ioExec.submit(() -> {
-                try {
-                    renderLatch.await();
-                    frameQueue.put(POISON);
-                } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-            });
-
-            // ── 인코딩 (메인 스레드, 순서 보장) ───────────────
-            Java2DFrameConverter converter = new Java2DFrameConverter();
-            // 순서 재정렬 버퍼 (fIdx → px)
-            Map<Long, Object[]> outOfOrder = new TreeMap<>();
-            long nextExpected = 0;
-            long lastLog      = 0;
-
-            while (true) {
-                Object[] item = frameQueue.poll(5, TimeUnit.SECONDS);
-                if (item == null) { log.warn("[{}] 렌더 큐 타임아웃", filename); break; }
-                if (item == POISON) break;
-
-                long   fIdx = (long) item[0];
-                byte[] px   = (byte[]) item[1];
-                BufferedImage buf = (BufferedImage) item[2];
-
-                // 순서 재조립
-                outOfOrder.put(fIdx, item);
-                while (outOfOrder.containsKey(nextExpected)) {
-                    Object[] ordered = outOfOrder.remove(nextExpected);
-                    byte[]   opx     = (byte[]) ordered[1];
-                    BufferedImage obuf = (BufferedImage) ordered[2];
-                    System.arraycopy(opx, 0,
-                            ((DataBufferByte) obuf.getRaster().getDataBuffer()).getData(), 0, opx.length);
-                    recorder.record(converter.convert(obuf), avutil.AV_PIX_FMT_BGR24);
-                    nextExpected++;
-
-                    if (nextExpected - lastLog >= fps * 5L) {
-                        log.debug("[{}] {}% ({}/{})", filename,
-                                String.format("%.0f", (double) nextExpected / totalFrames * 100),
-                                nextExpected, totalFrames);
-                        lastLog = nextExpected;
-                    }
-                }
-            }
-
-            try { audioFuture.get(30, TimeUnit.SECONDS); }
-            catch (Exception e) { log.warn("오디오 완료 대기: {}", e.getMessage()); }
-
-            renderPool.shutdown();
-            ioExec.shutdown();
+            // 비디오 렌더링
+            renderFrames(recorder, bgR, bgG, bgB, accent,
+                    particles, chunks, chunkTimes,
+                    totalFrames, fps, filename);
 
         } finally {
             try { recorder.stop();    } catch (Exception e) { log.warn("stop: {}",    e.getMessage()); }
             try { recorder.release(); } catch (Exception e) { log.warn("release: {}", e.getMessage()); }
-            // ⑬ GC: 완료 후 캐시 일괄 해제
-            subtitleCache.clear();
         }
 
         log.info("✅ [{}] 완료: {}", filename, outputPath);
         return outputPath;
     }
 
-    // ─────────────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────
     //  프레임 렌더링
-    // ─────────────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────
 
-    private byte[] renderFrameBytes(
-            BufferedImage bgLayer, BufferedImage work,
-            String subtitle, Map<String, byte[]> cache) {
+    private void renderFrames(
+            FFmpegFrameRecorder recorder,
+            int bgR, int bgG, int bgB, int[] accent,
+            Particle[] particles,
+            List<String> chunks, double[] chunkTimes,
+            long totalFrames, int fps, String jobId) throws Exception {
 
-        // ⑫ 빈 자막 정규화
-        String key = (subtitle == null || subtitle.isBlank()) ? "" : subtitle.trim();
-        byte[] hit = cache.get(key);
-        if (hit != null) return hit;
+        Java2DFrameConverter converter = new Java2DFrameConverter();
+        BufferedImage buffer = new BufferedImage(WIDTH, HEIGHT, BufferedImage.TYPE_3BYTE_BGR);
 
-        Graphics2D g = work.createGraphics();
+        long lastLog = 0;
+
+        for (long frameIdx = 0; frameIdx < totalFrames; frameIdx++) {
+            double currentTime = (double) frameIdx / fps;
+            String subtitle    = getSubtitleByTime(chunks, chunkTimes, currentTime);
+
+            // 파티클 업데이트
+            for (Particle p : particles) p.update();
+
+            // 프레임 렌더링
+            renderFrame(buffer, bgR, bgG, bgB, accent, particles, subtitle, frameIdx, fps);
+
+            recorder.setTimestamp((long)(currentTime * 1_000_000));
+            recorder.record(converter.convert(buffer), avutil.AV_PIX_FMT_BGR24);
+
+            if (frameIdx - lastLog >= fps * 5L) {
+                log.debug("[{}] {}% ({}/{})", jobId,
+                        String.format("%.0f", (double) frameIdx / totalFrames * 100),
+                        frameIdx, totalFrames);
+                lastLog = frameIdx;
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    //  단일 프레임 렌더링
+    // ─────────────────────────────────────────────────────────────
+
+    private void renderFrame(
+            BufferedImage buffer,
+            int bgR, int bgG, int bgB, int[] accent,
+            Particle[] particles,
+            String subtitle,
+            long frameIdx, int fps) {
+
+        Graphics2D g = buffer.createGraphics();
         g.setRenderingHint(RenderingHints.KEY_ANTIALIASING,      RenderingHints.VALUE_ANTIALIAS_ON);
         g.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_GASP);
         g.setRenderingHint(RenderingHints.KEY_RENDERING,         RenderingHints.VALUE_RENDER_SPEED);
-        g.drawImage(bgLayer, 0, 0, null);
 
-        if (!key.isEmpty()) drawSubtitle(g, key);
+        // ── 1. 그라데이션 배경 ──────────────────────────────────
+        drawGradientBackground(g, bgR, bgG, bgB);
+
+        // ── 2. 파티클 ───────────────────────────────────────────
+        drawParticles(g, particles);
+
+        // ── 3. 하단 자막 영역 반투명 바 ─────────────────────────
+        if (subtitle != null && !subtitle.isBlank()) {
+            drawSubtitleBar(g, accent);
+            drawSubtitle(g, subtitle);
+        }
+
         g.dispose();
-
-        byte[] raster   = ((DataBufferByte) work.getRaster().getDataBuffer()).getData();
-        byte[] snapshot = Arrays.copyOf(raster, raster.length);
-
-        // ⑬ 캐시 크기 제한 (최대 200항목 — 일반적인 60초 영상 청크 수의 2배)
-        if (cache.size() < 200) cache.put(key, snapshot);
-        return snapshot;
     }
 
-    // ─────────────────────────────────────────────────────────────────
-    //  자막 렌더링 (TextLayout + BasicStroke)
-    // ─────────────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────
+    //  배경 그라데이션
+    // ─────────────────────────────────────────────────────────────
+
+    private void drawGradientBackground(Graphics2D g, int r, int gr, int b) {
+        // 3단 그라데이션: 상단 밝음 → 중간 → 하단 어두움
+        Color top    = new Color(Math.min(r + 30, 255), Math.min(gr + 30, 255), Math.min(b + 30, 255));
+        Color mid    = new Color(r, gr, b);
+        Color bottom = new Color(Math.max(r - 50, 0), Math.max(gr - 50, 0), Math.max(b - 50, 0));
+
+        // 상단 → 중간
+        g.setPaint(new GradientPaint(0, 0, top, 0, HEIGHT / 2, mid));
+        g.fillRect(0, 0, WIDTH, HEIGHT / 2);
+
+        // 중간 → 하단
+        g.setPaint(new GradientPaint(0, HEIGHT / 2, mid, 0, HEIGHT, bottom));
+        g.fillRect(0, HEIGHT / 2, WIDTH, HEIGHT / 2);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    //  파티클 렌더링
+    // ─────────────────────────────────────────────────────────────
+
+    private void drawParticles(Graphics2D g, Particle[] particles) {
+        for (Particle p : particles) {
+            Color c = new Color(
+                    p.color.getRed(),
+                    p.color.getGreen(),
+                    p.color.getBlue(),
+                    (int)(p.alpha * 255)
+            );
+            g.setColor(c);
+
+            // 큰 파티클은 원, 작은 파티클은 점
+            if (p.size >= 8) {
+                // 글로우 효과 (2겹)
+                g.setColor(new Color(
+                        p.color.getRed(), p.color.getGreen(), p.color.getBlue(),
+                        (int)(p.alpha * 80)));
+                g.fillOval((int)p.x - p.size, (int)p.y - p.size,
+                        p.size * 2, p.size * 2);
+                // 중심
+                g.setColor(c);
+                g.fillOval((int)p.x - p.size / 2, (int)p.y - p.size / 2,
+                        p.size, p.size);
+            } else {
+                g.fillOval((int)p.x - p.size / 2, (int)p.y - p.size / 2,
+                        p.size, p.size);
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    //  자막 바 + 자막
+    // ─────────────────────────────────────────────────────────────
+
+    private void drawSubtitleBar(Graphics2D g, int[] accent) {
+        int barHeight = 180;
+        int barY      = HEIGHT - barHeight - 60;
+
+        // 반투명 블러 바
+        g.setColor(new Color(0, 0, 0, 140));
+        g.fillRoundRect(40, barY - 20, WIDTH - 80, barHeight + 40, 30, 30);
+
+        // 상단 강조선
+        g.setColor(new Color(accent[0], accent[1], accent[2], 200));
+        g.setStroke(new BasicStroke(3f));
+        g.drawLine(80, barY - 18, WIDTH - 80, barY - 18);
+    }
 
     private void drawSubtitle(Graphics2D g, String text) {
         g.setFont(CACHED_FONT);
         FontMetrics  fm    = g.getFontMetrics();
-        List<String> lines = wrapText(fm, text, WIDTH - 120);
-        int lh     = FONT_SIZE + 18;
-        int startY = (int)(HEIGHT * SUBTITLE_Y) - (lines.size() * lh) / 2;
+        List<String> lines = wrapText(fm, text, WIDTH - 160);
+        int lh     = FONT_SIZE + 16;
+        int baseY  = HEIGHT - 120 - (lines.size() * lh) / 2;
 
-        Stroke stroke = new BasicStroke(OUTLINE_WIDTH, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND);
-        Stroke prev   = g.getStroke();
+        Stroke outlineStroke = new BasicStroke(OUTLINE_WIDTH,
+                BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND);
+        Stroke prev = g.getStroke();
 
         for (int i = 0; i < lines.size(); i++) {
             String line = lines.get(i);
             int    x    = (WIDTH - fm.stringWidth(line)) / 2;
-            int    y    = startY + (i + 1) * lh;
+            int    y    = baseY + (i + 1) * lh;
 
             TextLayout layout  = new TextLayout(line, CACHED_FONT, g.getFontRenderContext());
             Shape      outline = layout.getOutline(AffineTransform.getTranslateInstance(x, y));
 
-            g.setColor(new Color(0, 0, 0, 220));
-            g.setStroke(stroke);
+            // 외곽선
+            g.setColor(new Color(0, 0, 0, 230));
+            g.setStroke(outlineStroke);
             g.draw(outline);
+
+            // 본문
             g.setStroke(prev);
             g.setColor(Color.WHITE);
             g.fill(outline);
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────
-    //  ⑩ 배경 렌더링 (그라데이션 or 단색)
-    // ─────────────────────────────────────────────────────────────────
-
-    private BufferedImage renderBackground(int r, int g, int b) {
-        BufferedImage bg = new BufferedImage(WIDTH, HEIGHT, BufferedImage.TYPE_3BYTE_BGR);
-        Graphics2D g2 = bg.createGraphics();
-        g2.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);
-
-        // 요청 색상에 살짝 어두운 버전으로 그라데이션 생성
-        Color top    = new Color(Math.min(r + 20, 255), Math.min(g + 20, 255), Math.min(b + 20, 255));
-        Color bottom = new Color(Math.max(r - 30, 0),  Math.max(g - 30, 0),  Math.max(b - 30, 0));
-        g2.setPaint(new GradientPaint(0, 0, top, 0, HEIGHT, bottom));
-        g2.fillRect(0, 0, WIDTH, HEIGHT);
-        g2.dispose();
-        return bg;
-    }
-
-    // ─────────────────────────────────────────────────────────────────
-    //  오디오 삽입 / FFmpeg 설정 / 유틸
-    // ─────────────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────
+    //  오디오 삽입 — 순차 삽입 (노이즈 방지)
+    // ─────────────────────────────────────────────────────────────
 
     private void injectAudio(FFmpegFrameRecorder recorder, String audioPath) {
         try (FFmpegFrameGrabber grabber = new FFmpegFrameGrabber(audioPath)) {
             grabber.setAudioChannels(1);
-            grabber.setSampleRate(22050);
+            grabber.setSampleRate(SAMPLE_RATE);
             grabber.start();
             Frame f;
             while ((f = grabber.grabSamples()) != null) {
-                synchronized (recorder) { recorder.record(f); }
+                recorder.record(f);
             }
+            log.debug("오디오 삽입 완료");
         } catch (Exception e) {
             log.warn("오디오 삽입 오류: {}", e.getMessage());
         }
     }
 
-    /** ⑨ VideoRenderProfile에서 설정 값 주입 */
+    // ─────────────────────────────────────────────────────────────
+    //  ② 자막 타이밍 — 단어 수 기반 가중치
+    // ─────────────────────────────────────────────────────────────
+
+    /**
+     * 각 청크의 단어 수에 비례해서 시간을 배분합니다.
+     * 기존 균등 분할 대비 실제 발화 속도에 가까운 타이밍.
+     *
+     * 예) 청크A 2단어, 청크B 4단어 → A는 1/3, B는 2/3 시간 배분
+     */
+    private double[] buildChunkTimings(List<String> chunks, double totalDuration) {
+        if (chunks.isEmpty()) return new double[0];
+
+        int[] wordCounts = chunks.stream()
+                .mapToInt(c -> c.split("\\s+").length)
+                .toArray();
+        int totalWords = Arrays.stream(wordCounts).sum();
+
+        double[] timings = new double[chunks.size() + 1]; // [시작시간, ..., 종료시간]
+        timings[0] = 0.0;
+        for (int i = 0; i < chunks.size(); i++) {
+            double weight = totalWords > 0
+                    ? (double) wordCounts[i] / totalWords
+                    : 1.0 / chunks.size();
+            timings[i + 1] = timings[i] + totalDuration * weight;
+        }
+        return timings;
+    }
+
+    private String getSubtitleByTime(List<String> chunks, double[] timings, double currentTime) {
+        if (chunks.isEmpty() || timings.length == 0) return "";
+        for (int i = 0; i < chunks.size(); i++) {
+            if (currentTime >= timings[i] && currentTime < timings[i + 1]) {
+                return chunks.get(i);
+            }
+        }
+        return chunks.get(chunks.size() - 1); // 마지막 청크 유지
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    //  보색 계산 (배경색 기반 파티클 강조색)
+    // ─────────────────────────────────────────────────────────────
+
+    private int[] computeAccentColor(int r, int g, int b) {
+        // HSB 변환 후 색조 180도 회전 (보색)
+        float[] hsb = Color.RGBtoHSB(r, g, b, null);
+        hsb[0] = (hsb[0] + 0.5f) % 1.0f; // 보색
+        hsb[1] = Math.max(hsb[1], 0.6f);  // 채도 최소 60%
+        hsb[2] = Math.max(hsb[2], 0.8f);  // 밝기 최소 80%
+        Color accent = Color.getHSBColor(hsb[0], hsb[1], hsb[2]);
+        return new int[]{accent.getRed(), accent.getGreen(), accent.getBlue()};
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    //  FFmpeg 레코더
+    // ─────────────────────────────────────────────────────────────
+
     private FFmpegFrameRecorder buildRecorder(String outputPath, int fps) {
         FFmpegFrameRecorder r = new FFmpegFrameRecorder(outputPath, WIDTH, HEIGHT, 0);
         r.setVideoCodec(avcodec.AV_CODEC_ID_H264);
@@ -308,23 +417,22 @@ public class VideoService {
         r.setVideoOption("movflags", "+faststart");
         r.setAudioCodec(avcodec.AV_CODEC_ID_AAC);
         r.setAudioChannels(1);
-        r.setSampleRate(22050);
+        r.setSampleRate(SAMPLE_RATE); // ③ 44100Hz 통일
         r.setAudioBitrate(128000);
         return r;
     }
 
-    private String getSubtitle(List<String> chunks, long fIdx, int fps, double timePerChunk) {
-        if (chunks.isEmpty()) return "";
-        int idx = Math.min((int)(fIdx / fps / timePerChunk), chunks.size() - 1);
-        return chunks.get(idx);
-    }
+    // ─────────────────────────────────────────────────────────────
+    //  유틸
+    // ─────────────────────────────────────────────────────────────
 
     private List<String> buildSubtitleChunks(String script) {
         if (script == null || script.isBlank()) return List.of();
         String[] words = script.split("\\s+");
         List<String> chunks = new ArrayList<>();
         for (int i = 0; i < words.length; i += CHUNK_SIZE)
-            chunks.add(String.join(" ", Arrays.copyOfRange(words, i, Math.min(i + CHUNK_SIZE, words.length))));
+            chunks.add(String.join(" ",
+                    Arrays.copyOfRange(words, i, Math.min(i + CHUNK_SIZE, words.length))));
         return chunks;
     }
 
@@ -341,7 +449,9 @@ public class VideoService {
     }
 
     private static Font resolveKoreanFont(int size) {
-        for (String n : new String[]{"Noto Sans KR","NanumGothic","NanumBarunGothic","맑은 고딕","Apple SD Gothic Neo"}) {
+        for (String n : new String[]{
+                "Noto Sans KR", "NanumGothic", "NanumBarunGothic",
+                "맑은 고딕", "Apple SD Gothic Neo"}) {
             Font f = new Font(n, Font.BOLD, size);
             if (f.canDisplay('가')) return f;
         }

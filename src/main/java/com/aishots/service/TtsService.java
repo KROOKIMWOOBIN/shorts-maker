@@ -22,8 +22,8 @@ public class TtsService {
 
     // piper 바이너리 및 모델 경로 (프로젝트 루트 기준)
     private static final String PIPER_DIR        = "piper";
-    private static final String PIPER_MODEL      = "piper/piper-kss-korean.onnx";
-    private static final String PIPER_MODEL_JSON = "piper/piper-kss-korean.onnx.json";
+    private static final String PIPER_MODEL      = "piper/en_US-lessac-medium.onnx";
+    private static final String PIPER_MODEL_JSON = "piper/en_US-lessac-medium.onnx.json";
 
     // OS별 바이너리 이름 자동 감지
     private static final String PIPER_BIN = resolvePiperBinary();
@@ -88,8 +88,42 @@ public class TtsService {
             throw new RuntimeException("Piper TTS 출력 파일 없음: " + outputPath);
         }
 
-        log.info("✅ TTS 완료: {} ({}KB)", outputPath,
-                Files.size(Paths.get(outputPath)) / 1024);
+        // WAV 리샘플링 22050Hz → 44100Hz (노이즈/끊김 방지)
+        String resampledPath = resampleWav(outputPath);
+        log.info("✅ TTS 완료: {} ({}KB)", resampledPath,
+                Files.size(Paths.get(resampledPath)) / 1024);
+        return resampledPath;
+    }
+
+    /**
+     * WAV 리샘플링 — Piper 22050Hz → 44100Hz
+     * 샘플레이트 불일치로 인한 노이즈/끊김 방지
+     */
+    private String resampleWav(String inputPath) throws Exception {
+        String outputPath = inputPath.replace(".wav", "_resampled.wav");
+
+        AudioInputStream sourceStream = AudioSystem.getAudioInputStream(new File(inputPath));
+        javax.sound.sampled.AudioFormat sourceFormat = sourceStream.getFormat();
+
+        // 44100Hz mono 16bit PCM으로 변환
+        javax.sound.sampled.AudioFormat targetFormat = new javax.sound.sampled.AudioFormat(
+                javax.sound.sampled.AudioFormat.Encoding.PCM_SIGNED,
+                44100,
+                16,
+                1,
+                2,
+                44100,
+                false
+        );
+
+        AudioInputStream resampledStream = AudioSystem.getAudioInputStream(targetFormat, sourceStream);
+        AudioSystem.write(resampledStream, javax.sound.sampled.AudioFileFormat.Type.WAVE,
+                new File(outputPath));
+
+        sourceStream.close();
+        resampledStream.close();
+
+        log.debug("WAV 리샘플링 완료: {}Hz → 44100Hz", (int) sourceFormat.getSampleRate());
         return outputPath;
     }
 
