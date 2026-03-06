@@ -5,6 +5,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.bytedeco.ffmpeg.global.avcodec;
 import org.bytedeco.ffmpeg.global.avutil;
 import org.bytedeco.javacv.*;
+import org.bytedeco.javacv.Frame;
 import org.springframework.stereotype.Service;
 
 import java.awt.*;
