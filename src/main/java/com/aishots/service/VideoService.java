@@ -284,7 +284,7 @@ public class VideoService {
     private void injectAudio(FFmpegFrameRecorder recorder, String audioPath) {
         try (FFmpegFrameGrabber grabber = new FFmpegFrameGrabber(audioPath)) {
             grabber.setAudioChannels(1);
-            grabber.setSampleRate(24000);
+            grabber.setSampleRate(22050);
             grabber.start();
             Frame f;
             while ((f = grabber.grabSamples()) != null) {
@@ -309,7 +309,7 @@ public class VideoService {
         r.setVideoOption("movflags", "+faststart");
         r.setAudioCodec(avcodec.AV_CODEC_ID_AAC);
         r.setAudioChannels(1);
-        r.setSampleRate(24000);
+        r.setSampleRate(22050);
         r.setAudioBitrate(128000);
         return r;
     }
