@@ -48,15 +48,19 @@ public class ScriptService {
                 Tone: %s
                 Target word count: approximately %d words
         
-                Respond ONLY in the following JSON format. Do not include any other text:
-        
-                {
-                    "title": "An engaging video title that drives clicks (under 60 chars)",
-                    "hook": "A powerful opening line that grabs viewers in the first 3 seconds (1-2 sentences)",
-                    "script": "Full narration script. Write as if speaking naturally.",
-                    "hashtags": ["#tag1", "#tag2", "#tag3", "#tag4", "#tag5"],
-                    "thumbnailPrompt": "English prompt for thumbnail image generation"
-                }
+                CRITICAL OUTPUT RULES:
+                        - Output ONLY raw JSON. No markdown. No ```json. No explanation.
+                        - script field: plain sentences only. NO asterisks, NO timestamps, NO stage directions, NO formatting.
+                        - Start your response with { and end with }
+                
+                        {
+                            "title": "Clickbait title under 60 chars",
+                            "hook": "1-2 shocking opening sentences",
+                            "script": "Plain narration text only. No formatting. No symbols. Just words.",
+                            "emotion": "SHOCKING",
+                            "hashtags": ["#tag1", "#tag2", "#tag3", "#tag4", "#tag5"],
+                            "thumbnailPrompt": "Vivid image description"
+                        }
                 """, durationSeconds, topic, tone, wordCount);
 
         String rawResponse = callOllama(prompt);
@@ -112,7 +116,20 @@ public class ScriptService {
             }
             int s = cleaned.indexOf('{'), e = cleaned.lastIndexOf('}');
             if (s >= 0 && e > s) cleaned = cleaned.substring(s, e + 1);
-            return objectMapper.readValue(cleaned, ScriptData.class);
+            ScriptData data = objectMapper.readValue(cleaned, ScriptData.class);
+            // 마크다운/타임스탬프/특수문자 제거
+            if (data.getScript() != null) {
+                String cleanScript = data.getScript()
+                        .replaceAll("\\*\\*.*?\\*\\*", "")         // **굵게** 제거
+                        .replaceAll("\\(\\d+-\\d+\\s*seconds?\\)", "") // (0-10 seconds) 제거
+                        .replaceAll("\\*", "")                      // * 제거
+                        .replaceAll("#(?!\\w)", "")                 // 단독 # 제거
+                        .replaceAll("\\[.*?\\]", "")                // [stage direction] 제거
+                        .replaceAll("\\s{2,}", " ")                 // 연속 공백 정리
+                        .trim();
+                data.setScript(cleanScript);
+            }
+            return data;
         } catch (Exception e) {
             // [보안] 원본 AI 응답 내용을 로그에만 기록, 클라이언트에는 미노출
             log.error("스크립트 JSON 파싱 실패. 원본 일부: {}",

@@ -114,7 +114,10 @@ public class ShortsGenerationService {
             long t1 = System.currentTimeMillis();
             List<Integer> bg = request.getBackgroundColor();
             videoService.createShortsVideo(
-                    audioPath, script.getScript(),
+                    audioPath,
+                    script.getScript(),
+                    script.getHook(),
+                    request.getTopic(),
                     bg.get(0), bg.get(1), bg.get(2), jobId);
             log.info("[{}] 영상 합성 완료: {}ms", jobId, System.currentTimeMillis() - t1);
 

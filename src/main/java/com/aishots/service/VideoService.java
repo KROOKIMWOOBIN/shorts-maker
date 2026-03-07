@@ -110,7 +110,7 @@ public class VideoService {
     // ─────────────────────────────────────────────────────────────
 
     public String createShortsVideo(
-            String audioPath, String script,
+            String audioPath, String script, String hookText, String topic,
             int bgR, int bgG, int bgB, String filename) throws Exception {
 
         String videoDir = "outputs/videos";

@@ -60,7 +60,7 @@ public class ShortsController {
     public ResponseEntity<?> generate(@Valid @RequestBody ShortsRequest request) {
         // tone / voice 화이트리스트 검증
         if (!ShortsRequest.ALLOWED_TONES.contains(request.getTone())) {
-            throw new ShortsException("허용되지 않는 말투입니다.");
+            throw new ShortsException("Invalid tone. Allowed: " + ShortsRequest.ALLOWED_TONES);
         }
         if (!ShortsRequest.ALLOWED_VOICES.contains(request.getVoice())) {
             throw new ShortsException("허용되지 않는 음성입니다.");

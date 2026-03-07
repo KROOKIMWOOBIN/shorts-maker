@@ -10,6 +10,7 @@ public class ScriptData {
     private String title;
     private String hook;
     private String script;
+    private String emotion;
     private List<String> hashtags;
     private String thumbnailPrompt;
 }

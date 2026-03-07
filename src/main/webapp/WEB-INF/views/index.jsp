@@ -97,20 +97,17 @@
     <div class="form-group">
       <label>말투 / 톤</label>
       <select id="tone">
-        <option value="친근하고 흥미롭게">🤝 친근하고 흥미롭게 (기본)</option>
-        <option value="전문적이고 신뢰감 있게">👔 전문적이고 신뢰감 있게</option>
-        <option value="유머러스하고 재미있게">😄 유머러스하고 재미있게</option>
-        <option value="놀랍고 충격적인 사실 전달">😱 놀랍고 충격적인 사실 전달</option>
-        <option value="차분하고 감성적으로">🌙 차분하고 감성적으로</option>
+        <option value="shocking and mind-blowing">Shocking & Mind-blowing</option>
+        <option value="inspiring and motivational">Inspiring & Motivational</option>
+        <option value="friendly and engaging">Friendly & Engaging</option>
+        <option value="professional and trustworthy">Professional & Trustworthy</option>
+        <option value="mysterious and scary">Mysterious & Scary</option>
       </select>
     </div>
     <div class="form-group">
       <label>나레이션 음성</label>
       <select id="voice">
-        <option value="여성_기본">👩 여성 - 밝고 친근함 (기본)</option>
-        <option value="남성_기본">👨 남성 - 안정적이고 신뢰감</option>
-        <option value="여성_활기">👱‍♀️ 여성 - 활기차고 에너제틱</option>
-        <option value="남성_중후">🎙️ 남성 - 중후하고 차분함</option>
+        <option value="en_US">English (US)</option>
       </select>
     </div>
     <div class="form-group">

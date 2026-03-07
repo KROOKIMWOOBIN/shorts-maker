@@ -18,16 +18,14 @@ import java.util.Set;
 public class ShortsRequest {
 
     public static final Set<String> ALLOWED_TONES = Set.of(
-            "친근하고 흥미롭게",
-            "전문적이고 신뢰감 있게",
-            "유머러스하고 재미있게",
-            "놀랍고 충격적인 사실 전달",
-            "차분하고 감성적으로"
+            "friendly and engaging",
+            "professional and trustworthy",
+            "shocking and mind-blowing",
+            "inspiring and motivational",
+            "mysterious and scary"
     );
 
-    public static final Set<String> ALLOWED_VOICES = Set.of(
-            "여성_기본", "남성_기본", "여성_활기", "남성_중후"
-    );
+    public static final Set<String> ALLOWED_VOICES = Set.of("en_US");
 
     @NotBlank(message = "주제를 입력해주세요.")
     @Size(min = 2, max = 100, message = "주제는 2자 이상 100자 이하로 입력해주세요.")
@@ -38,12 +36,12 @@ public class ShortsRequest {
     private int durationSeconds = 60;
 
     @NotBlank(message = "말투를 선택해주세요.")
-    private String tone = "friendly and engaging";
+    private String tone = "shocking and mind-blowing";
 
     @NotBlank(message = "음성을 선택해주세요.")
     private String voice = "en_US";
 
     @NotNull(message = "배경색을 선택해주세요.")
     @Size(min = 3, max = 3, message = "배경색은 RGB 3개 값이어야 합니다.")
-    private List<@NotNull @Min(0) @Max(255) Integer> backgroundColor = List.of(15, 15, 25);
+    private List<@NotNull @Min(0) @Max(255) Integer> backgroundColor = List.of(5, 5, 20);
 }
