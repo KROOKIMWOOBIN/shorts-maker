@@ -19,18 +19,17 @@ import java.util.concurrent.*;
 @RequiredArgsConstructor
 public class ShortsGenerationService {
 
-    private final ScriptService       scriptService;
-    private final TtsService          ttsService;
-    private final VideoService        videoService;
-    private final BgmGeneratorService bgmGeneratorService;
-    private final AnimateDiffService  animateDiffService;
-    // ThumbnailService 제거 — 유튜브 쇼츠는 썸네일 업로드 불가
+    private final ScriptService           scriptService;
+    private final TtsService              ttsService;
+    private final VideoService            videoService;
+    private final BgmGeneratorService     bgmGeneratorService;
+    private final StableDiffusionService  sdService;
 
     private final Map<String, JobStatus> jobStatusMap   = new ConcurrentHashMap<>();
     private final Map<String, Instant>   jobCompletedAt = new ConcurrentHashMap<>();
 
     private final ExecutorService parallelExecutor = Executors.newFixedThreadPool(3, r -> {
-        Thread t = new Thread(r, "parallel-generator");
+        Thread t = new Thread(r, "parallel-gen");
         t.setDaemon(true);
         return t;
     });
@@ -49,14 +48,16 @@ public class ShortsGenerationService {
     public void generateShorts(String jobId, ShortsRequest request) {
         long start = System.currentTimeMillis();
         try {
-            // ── Step 1: 스크립트 생성 ──────────────────────────
+            // Step 1: 스크립트 + 이미지 프롬프트 생성
             updateStatus(jobId, 10, "🤖 Generating script...");
             ScriptData script = scriptService.generateScript(
                     request.getTopic(), request.getDurationSeconds(), request.getTone());
-            log.info("[{}] 스크립트 완료: {}", jobId, script.getTitle());
+            log.info("[{}] 스크립트 완료: {}, imagePrompts={}개",
+                    jobId, script.getTitle(),
+                    script.getImagePrompts() != null ? script.getImagePrompts().size() : 0);
 
-            // ── Step 2: TTS + BGM 병렬 생성 ───────────────────
-            updateStatus(jobId, 25, "🎙️ Generating voice & BGM...");
+            // Step 2: TTS + BGM 병렬 생성
+            updateStatus(jobId, 20, "🎙️ Generating voice & BGM...");
             BgmStyle bgmStyle = BgmStyle.fromValue(request.getBgmStyle());
 
             CompletableFuture<String> ttsFuture = CompletableFuture.supplyAsync(() -> {
@@ -68,8 +69,7 @@ public class ShortsGenerationService {
             CompletableFuture<String> bgmFuture = CompletableFuture.supplyAsync(() -> {
                 try {
                     if (bgmStyle == BgmStyle.NONE) return null;
-                    return bgmGeneratorService.generateBgm(
-                            bgmStyle, request.getDurationSeconds(), jobId);
+                    return bgmGeneratorService.generateBgm(bgmStyle, request.getDurationSeconds(), jobId);
                 } catch (Exception e) {
                     log.warn("[{}] BGM 생성 실패 (스킵): {}", jobId, e.getMessage());
                     return null;
@@ -89,17 +89,20 @@ public class ShortsGenerationService {
                 throw new RuntimeException("TTS or BGM generation timed out");
             }
 
-            // ── Step 3: AnimateDiff 클립 생성 (ComfyUI 연결 시) ─
-            updateStatus(jobId, 45, "🎨 Generating AI video clips...");
-            List<String> clipPaths = List.of();
-            if (script.getVideoPrompts() != null && !script.getVideoPrompts().isEmpty()) {
-                clipPaths = animateDiffService.generateClips(script.getVideoPrompts(), jobId);
+            // Step 3: SD 이미지 생성
+            updateStatus(jobId, 45, "🎨 Generating images with Stable Diffusion...");
+            List<String> imagePaths = List.of();
+            if (script.getImagePrompts() != null && !script.getImagePrompts().isEmpty()) {
+                imagePaths = sdService.generateImages(script.getImagePrompts(), jobId);
             }
-            if (clipPaths.isEmpty()) {
-                log.info("[{}] AI 클립 없음 — Java2D 씬 렌더링", jobId);
+            if (imagePaths.isEmpty()) {
+                log.info("[{}] SD 이미지 없음 — Java2D 씬 폴백", jobId);
+                updateStatus(jobId, 55, "🎨 Rendering scenes (Java2D fallback)...");
+            } else {
+                log.info("[{}] SD 이미지 {}장 생성 완료", jobId, imagePaths.size());
             }
 
-            // ── Step 4: 영상 합성 ──────────────────────────────
+            // Step 4: 영상 합성
             updateStatus(jobId, 70, "🎬 Rendering video...");
             List<Integer> bg = request.getBackgroundColor();
             videoService.createShortsVideo(
@@ -107,7 +110,7 @@ public class ShortsGenerationService {
                     script.getScript(),
                     script.getHook(),
                     request.getTopic(),
-                    clipPaths,
+                    imagePaths,   // SD 이미지 경로 (없으면 빈 리스트 → 폴백)
                     bgmPath,
                     bg.get(0), bg.get(1), bg.get(2),
                     jobId);
