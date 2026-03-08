@@ -14,18 +14,12 @@ import org.springframework.web.reactive.function.client.WebClientResponseExcepti
 import java.time.Duration;
 import java.util.Map;
 
-/**
- * AI 스크립트 생성 서비스 (Ollama)
- *
- * [안정성] WebClient 응답 null 방어 처리
- * [보안]  예외 메시지에 내부 정보 포함하지 않도록 ShortsException 사용
- */
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class ScriptService {
 
-    private final WebClient webClient;
+    private final WebClient    webClient;
     private final ObjectMapper objectMapper;
 
     @Value("${ollama.api.url}")
@@ -38,40 +32,56 @@ public class ScriptService {
     private int timeoutSeconds;
 
     public ScriptData generateScript(String topic, int durationSeconds, String tone) {
-        int wordCount = durationSeconds * 3;
+        int wordCount = durationSeconds * 2;
 
         String prompt = String.format("""
-                You are a professional YouTube Shorts script writer.
-                Write a %d-second shorts script on the following topic.
-        
+                You are a world-class YouTube Shorts script writer.
+                Your scripts go viral because they hook viewers instantly and keep them watching.
+
+                Write a %d-second YouTube Shorts script on:
                 Topic: %s
                 Tone: %s
-                Target word count: approximately %d words
-        
+                Target word count: ~%d words
+
+                RULES:
+                - Hook must be shocking, surprising, or deeply curiosity-inducing
+                - Script must feel like a real person talking, not an essay
+                - Every sentence must make the viewer want to hear the next one
+                - End with a cliffhanger or revelation that makes them want more
+                - Include at least one surprising statistic or fact with a number
+                - First sentence must contain a number or percentage
+                - Use "you" and "your" to make it personal
+                - MAX 10 words per sentence
+                - NO filler phrases: "In conclusion", "As we can see", "It's worth noting"
+
                 CRITICAL OUTPUT RULES:
-                        - Output ONLY raw JSON. No markdown. No ```json. No explanation.
-                        - script field: plain sentences only. NO asterisks, NO timestamps, NO stage directions, NO formatting.
-                        - Start your response with { and end with }
-                
-                        {
-                            "title": "Clickbait title under 60 chars",
-                            "hook": "1-2 shocking opening sentences",
-                            "script": "Plain narration text only. No formatting. No symbols. Just words.",
-                            "emotion": "SHOCKING",
-                            "hashtags": ["#tag1", "#tag2", "#tag3", "#tag4", "#tag5"],
-                            "thumbnailPrompt": "Vivid image description"
-                        }
+                - Output ONLY raw JSON. No markdown. No ```json. No explanation.
+                - script field: plain sentences only. NO asterisks, NO timestamps, NO stage directions.
+                - Start your response with { and end with }
+
+                {
+                    "title": "Clickbait title under 60 chars that creates massive curiosity",
+                    "hook": "1-2 shocking opening sentences with a number or fact",
+                    "script": "Full plain narration. Conversational. No formatting. No symbols.",
+                    "emotion": "SHOCKING",
+                    "videoPrompts": [
+                        "cinematic wide shot of [specific visual scene 1], 4k, photorealistic, smooth motion",
+                        "dramatic close-up of [specific visual scene 2], golden hour, cinematic",
+                        "atmospheric shot of [specific visual scene 3], moody lighting, depth of field",
+                        "epic wide angle of [specific visual scene 4], sweeping camera movement"
+                    ],
+                    "hashtags": ["#tag1", "#tag2", "#tag3", "#tag4", "#tag5"],
+                    "thumbnailPrompt": "Vivid split image description for thumbnail"
+                }
                 """, durationSeconds, topic, tone, wordCount);
 
         String rawResponse = callOllama(prompt);
-        return parseScriptJson(rawResponse);
+        return parseAndClean(rawResponse);
     }
 
     private String callOllama(String prompt) {
         Map<String, Object> body = Map.of("model", model, "prompt", prompt, "stream", false);
-
         try {
-            // [안정성] response가 null인 경우 명시적으로 처리
             String response = webClient.post()
                     .uri(ollamaUrl)
                     .bodyValue(body)
@@ -80,30 +90,27 @@ public class ScriptService {
                     .timeout(Duration.ofSeconds(timeoutSeconds))
                     .block();
 
-            if (response == null || response.isBlank()) {
-                throw new ShortsException("AI 서버로부터 응답을 받지 못했습니다. Ollama가 실행 중인지 확인해주세요.");
-            }
+            if (response == null || response.isBlank())
+                throw new ShortsException("No response from AI. Is Ollama running?");
 
             JsonNode root = objectMapper.readTree(response);
             String text = root.path("response").asText();
-            if (text.isBlank()) {
-                throw new ShortsException("AI 스크립트 생성에 실패했습니다. 잠시 후 다시 시도해주세요.");
-            }
+            if (text.isBlank())
+                throw new ShortsException("AI returned empty script. Please try again.");
             return text;
 
         } catch (ShortsException e) {
-            throw e; // 비즈니스 예외는 그대로 전파
+            throw e;
         } catch (WebClientResponseException e) {
-            // [보안] HTTP 상태/바디 같은 내부 정보 노출 방지
-            log.error("Ollama HTTP 오류: {} {}", e.getStatusCode(), e.getMessage());
-            throw new ShortsException("AI 서버 연결에 실패했습니다. Ollama가 실행 중인지 확인해주세요.");
+            log.error("Ollama HTTP error: {} {}", e.getStatusCode(), e.getMessage());
+            throw new ShortsException("AI server connection failed. Is Ollama running?");
         } catch (Exception e) {
-            log.error("Ollama 호출 실패", e);
-            throw new ShortsException("AI 스크립트 생성에 실패했습니다. 잠시 후 다시 시도해주세요.");
+            log.error("Ollama call failed", e);
+            throw new ShortsException("Script generation failed. Please try again.");
         }
     }
 
-    private ScriptData parseScriptJson(String raw) {
+    private ScriptData parseAndClean(String raw) {
         try {
             String cleaned = raw.trim();
             if (cleaned.contains("```")) {
@@ -111,30 +118,31 @@ public class ScriptService {
                 for (String part : parts) {
                     String t = part.trim();
                     if (t.startsWith("json")) { cleaned = t.substring(4).trim(); break; }
-                    else if (t.startsWith("{"))  { cleaned = t; break; }
+                    else if (t.startsWith("{")) { cleaned = t; break; }
                 }
             }
             int s = cleaned.indexOf('{'), e = cleaned.lastIndexOf('}');
             if (s >= 0 && e > s) cleaned = cleaned.substring(s, e + 1);
+
             ScriptData data = objectMapper.readValue(cleaned, ScriptData.class);
-            // 마크다운/타임스탬프/특수문자 제거
+
+            // 스크립트 마크다운/타임스탬프 제거
             if (data.getScript() != null) {
-                String cleanScript = data.getScript()
-                        .replaceAll("\\*\\*.*?\\*\\*", "")         // **굵게** 제거
-                        .replaceAll("\\(\\d+-\\d+\\s*seconds?\\)", "") // (0-10 seconds) 제거
-                        .replaceAll("\\*", "")                      // * 제거
-                        .replaceAll("#(?!\\w)", "")                 // 단독 # 제거
-                        .replaceAll("\\[.*?\\]", "")                // [stage direction] 제거
-                        .replaceAll("\\s{2,}", " ")                 // 연속 공백 정리
+                String clean = data.getScript()
+                        .replaceAll("\\*\\*.*?\\*\\*", "")
+                        .replaceAll("\\(\\d+-\\d+\\s*seconds?\\)", "")
+                        .replaceAll("\\*", "")
+                        .replaceAll("#(?!\\w)", "")
+                        .replaceAll("\\[.*?\\]", "")
+                        .replaceAll("\\s{2,}", " ")
                         .trim();
-                data.setScript(cleanScript);
+                data.setScript(clean);
             }
             return data;
         } catch (Exception e) {
-            // [보안] 원본 AI 응답 내용을 로그에만 기록, 클라이언트에는 미노출
-            log.error("스크립트 JSON 파싱 실패. 원본 일부: {}",
+            log.error("Script JSON parse failed. Raw: {}",
                     raw.length() > 200 ? raw.substring(0, 200) + "..." : raw);
-            throw new ShortsException("스크립트 형식 파싱에 실패했습니다. 다시 시도해주세요.");
+            throw new ShortsException("Script format error. Please try again.");
         }
     }
 }

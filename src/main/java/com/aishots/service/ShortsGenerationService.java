@@ -14,33 +14,22 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.*;
 
-/**
- * 쇼츠 생성 파이프라인 — 병렬화 최적화 버전
- *
- * 기존 순차 파이프라인:
- *   스크립트(~30s) → TTS(~15s) → 썸네일(~2s) → 영상(~60s)  합계 ~107s
- *
- * 개선된 병렬 파이프라인:
- *   스크립트(~30s) → [TTS(~15s) ∥ 썸네일(~2s)] → 영상(~60s)  합계 ~90s
- *
- * TTS와 썸네일은 스크립트 데이터만 있으면 동시에 실행 가능.
- * 썸네일이 TTS보다 훨씬 빠르므로 실제 절약량 = TTS 시간의 대부분.
- */
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class ShortsGenerationService {
 
-    private final ScriptService    scriptService;
-    private final TtsService ttsService;
-    private final ThumbnailService thumbnailService;
-    private final VideoService     videoService;
+    private final ScriptService       scriptService;
+    private final TtsService          ttsService;
+    private final VideoService        videoService;
+    private final BgmGeneratorService bgmGeneratorService;
+    private final AnimateDiffService  animateDiffService;
+    // ThumbnailService 제거 — 유튜브 쇼츠는 썸네일 업로드 불가
 
-    private final Map<String, JobStatus> jobStatusMap  = new ConcurrentHashMap<>();
+    private final Map<String, JobStatus> jobStatusMap   = new ConcurrentHashMap<>();
     private final Map<String, Instant>   jobCompletedAt = new ConcurrentHashMap<>();
 
-    // TTS + 썸네일 병렬화용 전용 executor (최대 2 작업 동시)
-    private final ExecutorService parallelExecutor = Executors.newFixedThreadPool(2, r -> {
+    private final ExecutorService parallelExecutor = Executors.newFixedThreadPool(3, r -> {
         Thread t = new Thread(r, "parallel-generator");
         t.setDaemon(true);
         return t;
@@ -49,7 +38,7 @@ public class ShortsGenerationService {
     public void initJob(String jobId) {
         jobStatusMap.put(jobId, JobStatus.builder()
                 .jobId(jobId).status(JobStatus.Status.PENDING)
-                .progress(0).message("대기 중...").build());
+                .progress(0).message("Preparing...").build());
     }
 
     public JobStatus getStatus(String jobId) {
@@ -58,86 +47,87 @@ public class ShortsGenerationService {
 
     @Async
     public void generateShorts(String jobId, ShortsRequest request) {
-        long pipelineStart = System.currentTimeMillis();
+        long start = System.currentTimeMillis();
         try {
             // ── Step 1: 스크립트 생성 ──────────────────────────
-            updateStatus(jobId, 10, "🤖 AI 스크립트 생성 중...");
-            long t0 = System.currentTimeMillis();
+            updateStatus(jobId, 10, "🤖 Generating script...");
             ScriptData script = scriptService.generateScript(
                     request.getTopic(), request.getDurationSeconds(), request.getTone());
-            log.info("[{}] 스크립트 완료: {}ms", jobId, System.currentTimeMillis() - t0);
+            log.info("[{}] 스크립트 완료: {}", jobId, script.getTitle());
 
-            // ── Step 2+3: TTS & 썸네일 병렬 실행 ──────────────
-            updateStatus(jobId, 30, "🎙️ 음성 + 🎨 썸네일 동시 생성 중...");
+            // ── Step 2: TTS + BGM 병렬 생성 ───────────────────
+            updateStatus(jobId, 25, "🎙️ Generating voice & BGM...");
+            BgmStyle bgmStyle = BgmStyle.fromValue(request.getBgmStyle());
 
-            // TTS: 비동기 제출
             CompletableFuture<String> ttsFuture = CompletableFuture.supplyAsync(() -> {
                 try {
-                    long t = System.currentTimeMillis();
-                    String path = ttsService.generateAudio(script.getScript(), jobId, request.getVoice());
-                    log.info("[{}] TTS 완료: {}ms", jobId, System.currentTimeMillis() - t);
-                    return path;
-                } catch (Exception e) {
-                    throw new CompletionException(e);
-                }
+                    return ttsService.generateAudio(script.getScript(), jobId, request.getVoice());
+                } catch (Exception e) { throw new CompletionException(e); }
             }, parallelExecutor);
 
-            // 썸네일: 비동기 제출
-            CompletableFuture<String> thumbFuture = CompletableFuture.supplyAsync(() -> {
+            CompletableFuture<String> bgmFuture = CompletableFuture.supplyAsync(() -> {
                 try {
-                    long t = System.currentTimeMillis();
-                    String path = thumbnailService.createThumbnail(
-                            script.getTitle(), script.getHook(), jobId);
-                    log.info("[{}] 썸네일 완료: {}ms", jobId, System.currentTimeMillis() - t);
-                    return path;
+                    if (bgmStyle == BgmStyle.NONE) return null;
+                    return bgmGeneratorService.generateBgm(
+                            bgmStyle, request.getDurationSeconds(), jobId);
                 } catch (Exception e) {
-                    throw new CompletionException(e);
+                    log.warn("[{}] BGM 생성 실패 (스킵): {}", jobId, e.getMessage());
+                    return null;
                 }
             }, parallelExecutor);
 
-            // 둘 다 완료될 때까지 대기
-            String audioPath;
+            String audioPath, bgmPath;
             try {
                 audioPath = ttsFuture.get(90, TimeUnit.SECONDS);
-                thumbFuture.get(30, TimeUnit.SECONDS); // 썸네일은 짧음
+                bgmPath   = bgmFuture.get(30, TimeUnit.SECONDS);
             } catch (CompletionException ce) {
                 Throwable cause = ce.getCause();
                 throw (cause instanceof Exception ex) ? ex : new RuntimeException(cause);
             } catch (TimeoutException e) {
                 ttsFuture.cancel(true);
-                thumbFuture.cancel(true);
-                throw new RuntimeException("TTS 또는 썸네일 생성 시간 초과");
+                bgmFuture.cancel(true);
+                throw new RuntimeException("TTS or BGM generation timed out");
+            }
+
+            // ── Step 3: AnimateDiff 클립 생성 (ComfyUI 연결 시) ─
+            updateStatus(jobId, 45, "🎨 Generating AI video clips...");
+            List<String> clipPaths = List.of();
+            if (script.getVideoPrompts() != null && !script.getVideoPrompts().isEmpty()) {
+                clipPaths = animateDiffService.generateClips(script.getVideoPrompts(), jobId);
+            }
+            if (clipPaths.isEmpty()) {
+                log.info("[{}] AI 클립 없음 — Java2D 씬 렌더링", jobId);
             }
 
             // ── Step 4: 영상 합성 ──────────────────────────────
-            updateStatus(jobId, 65, "🎬 영상 합성 중...");
-            long t1 = System.currentTimeMillis();
+            updateStatus(jobId, 70, "🎬 Rendering video...");
             List<Integer> bg = request.getBackgroundColor();
             videoService.createShortsVideo(
                     audioPath,
                     script.getScript(),
                     script.getHook(),
                     request.getTopic(),
-                    bg.get(0), bg.get(1), bg.get(2), jobId);
-            log.info("[{}] 영상 합성 완료: {}ms", jobId, System.currentTimeMillis() - t1);
+                    clipPaths,
+                    bgmPath,
+                    bg.get(0), bg.get(1), bg.get(2),
+                    jobId);
 
-            // ── 완료 ───────────────────────────────────────────
-            long total = System.currentTimeMillis() - pipelineStart;
+            long total = System.currentTimeMillis() - start;
             jobStatusMap.put(jobId, JobStatus.builder()
                     .jobId(jobId).status(JobStatus.Status.COMPLETED)
-                    .progress(100).message("✅ 영상 생성 완료! (" + (total / 1000) + "초)")
+                    .progress(100)
+                    .message("✅ Video ready! (" + (total / 1000) + "s)")
                     .script(script)
                     .videoUrl("/videos/" + jobId + ".mp4")
-                    .thumbnailUrl("/thumbnails/" + jobId + ".jpg")
                     .build());
             jobCompletedAt.put(jobId, Instant.now());
-            log.info("[{}] 전체 파이프라인 완료: {}ms", jobId, total);
+            log.info("[{}] 전체 완료: {}ms", jobId, total);
 
         } catch (Exception e) {
             log.error("[{}] 생성 실패: {}", jobId, e.getMessage(), e);
             jobStatusMap.put(jobId, JobStatus.builder()
                     .jobId(jobId).status(JobStatus.Status.ERROR)
-                    .progress(0).message("영상 생성 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.")
+                    .progress(0).message("Video generation failed. Please try again.")
                     .build());
             jobCompletedAt.put(jobId, Instant.now());
         }
@@ -149,7 +139,6 @@ public class ShortsGenerationService {
         jobCompletedAt.entrySet().removeIf(entry -> {
             if (entry.getValue().isBefore(threshold)) {
                 jobStatusMap.remove(entry.getKey());
-                log.debug("만료 작업 제거: {}", entry.getKey());
                 return true;
             }
             return false;

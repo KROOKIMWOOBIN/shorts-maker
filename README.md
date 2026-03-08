@@ -1,275 +1,224 @@
-# 🎬 AI Shorts Maker
+# 🎬 Shorts Maker
 
-> Spring Boot 기반 YouTube Shorts 자동 생성기  
-> AI 스크립트 → TTS 음성 → 썸네일 → 영상 합성까지 완전 자동화
-
----
-
-## 📋 목차
-
-- [소개](#소개)
-- [기술 스택](#기술-스택)
-- [프로젝트 구조](#프로젝트-구조)
-- [사전 준비](#사전-준비)
-- [설치 및 실행](#설치-및-실행)
-- [설정](#설정)
-- [API](#api)
-- [성능 최적화](#성능-최적화)
+AI 기반 유튜브 쇼츠 자동 생성기  
+주제 입력 → AI 스크립트 → AI 영상 클립 → TTS → BGM → 완성된 쇼츠
 
 ---
 
-## 소개
-
-주제 하나만 입력하면 AI가 스크립트를 작성하고, TTS로 음성을 생성하고,
-썸네일과 영상을 자동으로 만들어주는 YouTube Shorts 제작 도구입니다.
+## 📋 전체 파이프라인
 
 ```
 주제 입력
-  → Ollama (AI 스크립트 생성)
-  → Piper TTS (음성 생성)  ─┐ 병렬
-  → Java2D (썸네일 생성)   ─┘
-  → JavaCV/FFmpeg (영상 합성)
-  → MP4 출력
+    ↓
+Ollama (gemma3) → 스크립트 + 영상 프롬프트 4개 생성
+    ↓
+[병렬] Piper TTS → 나레이션 WAV
+[병렬] BgmGenerator → 스타일별 BGM WAV (Java 자체 생성)
+    ↓
+AnimateDiff (ComfyUI) → AI 영상 클립 생성
+※ ComfyUI 미실행 시 Java2D 씬으로 자동 폴백
+    ↓
+JavaCV (FFmpeg) → 클립 + 자막 + 오디오 합성
+    ↓
+완성된 쇼츠 MP4 (1080x1920)
 ```
 
 ---
 
-## 기술 스택
+## 🖥️ 시스템 요구사항
 
-| 분류 | 기술 |
-|------|------|
-| 백엔드 | Spring Boot 3.2, Java 17 |
-| 영상 합성 | JavaCV 1.5.10 / FFmpeg 6.1.1 |
-| AI 스크립트 | Ollama (gemma3) |
-| TTS | Piper TTS (로컬, 오프라인) |
-| 썸네일 | Java2D |
-| 빌드 | Gradle |
-| 뷰 | JSP |
+| 항목 | 최소 | 권장 |
+|---|---|---|
+| OS | Windows 10 / macOS 12 / Ubuntu 20.04 | Windows 11 |
+| Java | 17 | 17 |
+| RAM | 8GB | 16GB+ |
+| GPU | 없어도 동작 (폴백) | RTX 3060+ (AnimateDiff용) |
+| 저장공간 | 10GB | 20GB+ |
 
 ---
 
-## 프로젝트 구조
+## ⚙️ 사전 준비
+
+### 1. Java 17 설치
+```bash
+# Windows: https://adoptium.net 에서 Java 17 다운로드
+java -version  # 확인
+```
+
+### 2. Ollama 설치 및 모델 다운로드
+```bash
+# https://ollama.com 에서 설치
+ollama pull gemma3
+ollama serve  # 백그라운드 실행
+```
+
+### 3. Piper TTS 설정
+```
+프로젝트루트/piper/ 폴더 생성 후:
+- Windows: piper.exe
+- Mac/Linux: piper (실행권한 chmod +x piper)
+- en_US-lessac-medium.onnx
+- en_US-lessac-medium.onnx.json
+- 기타 DLL (Windows)
+
+다운로드: https://github.com/rhasspy/piper/releases
+모델: https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/
+```
+
+### 4. ComfyUI + AnimateDiff 설치 (선택, AI 영상 클립용)
+```bash
+git clone https://github.com/comfyanonymous/ComfyUI
+cd ComfyUI
+pip install -r requirements.txt
+
+# AnimateDiff + VideoHelper 플러그인
+cd custom_nodes
+git clone https://github.com/Kosinkadink/ComfyUI-AnimateDiff-Evolved
+git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite
+
+# 모델 파일 배치
+# ComfyUI/models/checkpoints/ → v1-5-pruned-emaonly.ckpt
+#   다운로드: https://huggingface.co/runwayml/stable-diffusion-v1-5
+# ComfyUI/models/animatediff_models/ → mm_sd_v15_v2.ckpt
+#   다운로드: https://huggingface.co/guoyww/animatediff
+
+# 실행 (항상 백그라운드로)
+python main.py --listen 0.0.0.0 --port 8188
+```
+
+> ⚠️ ComfyUI 없이도 동작합니다. Java2D 씬으로 자동 폴백됩니다.
+
+---
+
+## 🚀 실행
+
+```bash
+# 프로젝트 루트에서
+./gradlew bootRun
+
+# 또는 빌드 후 실행
+./gradlew build
+java -jar build/libs/shorts-maker-1.0.0.war
+```
+
+브라우저에서 `http://localhost:8080` 접속
+
+---
+
+## 📁 프로젝트 구조
 
 ```
 shorts-maker/
-├── piper/                              # Piper TTS 바이너리 + 모델
-│   ├── piper.exe                       # Windows 바이너리
-│   ├── en_US-lessac-medium.onnx        # 영어 음성 모델
-│   ├── en_US-lessac-medium.onnx.json   # 모델 설정
-│   ├── onnxruntime.dll
-│   ├── piper_phonemize.dll
-│   ├── espeak-ng.dll
-│   ├── onnxruntime_providers_shared.dll
-│   ├── libtashkeel_model.ort
-│   └── espeak-ng-data/
-├── outputs/                            # 생성 결과물 (자동 생성)
-│   ├── audio/                          # WAV 음성 파일
-│   ├── videos/                         # MP4 영상 파일
-│   └── thumbnails/                     # JPG 썸네일 파일
 ├── src/main/java/com/aishots/
-│   ├── AiShortsApplication.java        # 애플리케이션 진입점
 │   ├── config/
-│   │   ├── AppConfig.java              # WebClient, Executor 설정
-│   │   └── VideoRenderProfile.java     # 하드웨어 자동 감지 프로파일
+│   │   ├── AppConfig.java              # WebClient, ObjectMapper, ThreadPool
+│   │   └── VideoRenderProfile.java     # GPU 자동 감지 (FAST/BALANCED/QUALITY)
 │   ├── controller/
-│   │   └── ShortsController.java       # REST API 컨트롤러
+│   │   └── ShortsController.java       # REST API + 페이지
 │   ├── dto/
-│   │   ├── ShortsRequest.java          # 요청 DTO
-│   │   ├── ScriptData.java             # 스크립트 데이터 DTO
-│   │   └── JobStatus.java              # 작업 상태 DTO
+│   │   ├── JobStatus.java              # 작업 상태
+│   │   ├── ScriptData.java             # AI 생성 스크립트 + 영상 프롬프트
+│   │   └── ShortsRequest.java          # 생성 요청 (topic, tone, bgmStyle 등)
 │   ├── exception/
-│   │   ├── ShortsException.java        # 비즈니스 예외
-│   │   └── GlobalExceptionHandler.java # 전역 예외 처리
-│   ├── service/
-│   │   ├── ShortsGenerationService.java # 파이프라인 오케스트레이터
-│   │   ├── ScriptService.java           # Ollama AI 스크립트 생성
-│   │   ├── TtsService.java              # Piper TTS 음성 생성
-│   │   ├── ThumbnailService.java        # Java2D 썸네일 생성
-│   │   └── VideoService.java            # JavaCV 영상 합성
-│   └── util/
-│       └── PathUtils.java               # 경로 보안 유틸
+│   │   ├── GlobalExceptionHandler.java
+│   │   └── ShortsException.java
+│   └── service/
+│       ├── AnimateDiffService.java     # ComfyUI API → AI 영상 클립 생성
+│       ├── BgmGeneratorService.java    # Java Sound API → BGM 자체 생성
+│       ├── BgmStyle.java               # BGM 스타일 enum
+│       ├── EmotionTone.java            # 감정 기반 색상 시스템
+│       ├── SceneRenderer.java          # Java2D 씬 렌더러 (폴백용)
+│       ├── SceneType.java              # 씬 타입 (SPACE/CITY/NATURE 등)
+│       ├── ScriptService.java          # Ollama 스크립트 생성
+│       ├── ShortsGenerationService.java # 전체 파이프라인 조율
+│       ├── TtsService.java             # Piper TTS
+│       └── VideoService.java           # FFmpeg 영상 합성
 ├── src/main/resources/
 │   └── application.properties
 ├── src/main/webapp/WEB-INF/views/
-│   └── index.jsp
+│   └── index.jsp                       # UI
+├── piper/                              # Piper TTS 바이너리 + 모델
+├── outputs/                            # 생성된 파일들 (자동 생성)
+│   ├── audio/
+│   ├── videos/
+│   ├── clips/
+│   └── bgm_generated/
 └── build.gradle
 ```
 
 ---
 
-## 사전 준비
+## 🎵 BGM 스타일
 
-### 1. Java 17+
+UI에서 선택 가능. 외부 파일 없이 Java로 직접 생성.
 
-```bash
-java -version
-```
-
-### 2. Ollama 설치 및 모델 다운로드
-
-```bash
-# Ollama 설치: https://ollama.com
-ollama pull gemma3
-ollama serve
-```
-
-### 3. Piper TTS 바이너리 + 모델
-
-**바이너리 다운로드** (OS에 맞게 선택)
-
-| OS | 파일 |
-|----|------|
-| Windows | `piper_windows_amd64.zip` |
-| Linux x86 | `piper_linux_x86_64.tar.gz` |
-| Mac Intel | `piper_macos_x64.tar.gz` |
-| Mac M1/M2 | `piper_macos_aarch64.tar.gz` |
-
-```
-https://github.com/rhasspy/piper/releases/tag/2023.11.14-2
-```
-
-압축 해제 후 `piper/` 폴더에 전체 파일 복사.
-
-**영어 음성 모델 다운로드**
-
-```
-https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/en_US-lessac-medium.onnx
-https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json
-```
-
-두 파일을 `piper/` 폴더에 저장.
-
-**Linux/Mac 실행 권한 부여**
-
-```bash
-chmod +x piper/piper
-```
-
-**동작 확인**
-
-```bash
-# Windows
-echo Hello this is a test | piper\piper.exe --model piper\en_US-lessac-medium.onnx --output_file test.wav
-
-# Linux/Mac
-echo "Hello this is a test" | ./piper/piper --model piper/en_US-lessac-medium.onnx --output_file test.wav
-```
+| 스타일 | 특징 |
+|---|---|
+| Upbeat & Energetic | 140bpm, 밝은 C장조, 킥 드럼 |
+| Calm & Relaxing | 70bpm, 사인파, 아르페지오 |
+| Mysterious & Dark | 90bpm, 프리지안 스케일, 저음 드론 |
+| Inspiring & Epic | 110bpm, 5도 화음, 크레셴도 |
+| Cute & Playful | 130bpm, 고음 스타카토, 글로켄슈필 |
+| No BGM | BGM 없음 |
 
 ---
 
-## 설치 및 실행
+## 🎨 씬 자동 매핑
 
-```bash
-# 1. 빌드
-./gradlew build
+주제 키워드에 따라 배경 씬 자동 선택 (ComfyUI 미연결 시)
 
-# 2. 실행
-./gradlew bootRun
-```
-
-브라우저에서 접속:
-
-```
-http://localhost:8080
-```
-
----
-
-## 설정
-
-`src/main/resources/application.properties`
-
-```properties
-# Ollama
-ollama.api.url=http://localhost:11434/api/generate
-ollama.model=gemma3
-ollama.timeout=120
-
-# 출력 경로
-output.audio.dir=outputs/audio
-output.video.dir=outputs/videos
-output.thumbnail.dir=outputs/thumbnails
-```
+| 키워드 | 씬 |
+|---|---|
+| space, galaxy, universe | 🌌 SPACE |
+| city, urban, building | 🌃 CITY |
+| nature, forest, mountain | 🌿 NATURE |
+| ocean, sea, water | 🌊 OCEAN |
+| fire, energy, explosion | 🔥 FIRE |
+| tech, ai, computer, code | 💻 TECH |
+| dark, mystery, horror | 🌑 DARK |
+| 그 외 | ✨ ABSTRACT (감정 색상) |
 
 ---
 
-## API
+## 🔌 API
 
-### 영상 생성 요청
+| 메서드 | 경로 | 설명 |
+|---|---|---|
+| POST | /api/shorts/generate | 영상 생성 시작 |
+| GET | /api/shorts/status/{jobId} | 작업 상태 조회 |
+| GET | /api/shorts/download/video/{jobId} | 영상 다운로드 |
+| GET | /api/comfyui/status | ComfyUI 연결 상태 |
+| GET | /api/shorts/script/preview?topic= | 스크립트 미리보기 |
 
-```http
-POST /api/shorts/generate
-Content-Type: application/json
-
-{
-  "topic": "The history of space exploration",
-  "durationSeconds": 60,
-  "tone": "friendly and engaging",
-  "voice": "en_US",
-  "backgroundColor": [20, 20, 40]
-}
-```
-
-### 생성 상태 조회
-
-```http
-GET /api/shorts/status/{jobId}
-```
-
-응답:
-
+### 요청 예시
 ```json
+POST /api/shorts/generate
 {
-  "jobId": "uuid",
-  "status": "COMPLETED",
-  "progress": 100,
-  "message": "✅ Video generated! (87s)",
-  "videoUrl": "/videos/uuid.mp4",
-  "thumbnailUrl": "/thumbnails/uuid.jpg"
+  "topic": "black holes",
+  "durationSeconds": 60,
+  "tone": "shocking and mind-blowing",
+  "voice": "en_US",
+  "bgmStyle": "MYSTERIOUS",
+  "backgroundColor": [5, 5, 20]
 }
 ```
 
-### 상태값
-
-| status | 설명 |
-|--------|------|
-| `PENDING` | 대기 중 |
-| `PROCESSING` | 생성 중 |
-| `COMPLETED` | 완료 |
-| `ERROR` | 오류 |
-
 ---
 
-## 성능 최적화
+## ⚠️ 자주 발생하는 문제
 
-### 하드웨어 자동 감지 (VideoRenderProfile)
+### Piper TTS exitCode=-1073740791
+→ piper 폴더를 프로젝트 루트에 배치했는지 확인  
+→ DLL 파일들이 piper/ 폴더 안에 모두 있는지 확인
 
-CPU 코어 수와 힙 메모리를 감지해서 자동으로 렌더링 프로파일을 선택합니다.
+### Ollama 응답 없음
+→ `ollama serve` 실행 여부 확인  
+→ `http://localhost:11434` 접속 확인
 
-| 프로파일 | 조건 | preset | CRF | FPS |
-|----------|------|--------|-----|-----|
-| FAST | 2코어 이하 또는 RAM 1GB 미만 | ultrafast | 30 | 24 |
-| BALANCED | 4코어 이하 또는 RAM 3GB 미만 | superfast | 26 | 30 |
-| QUALITY | 4코어 초과, RAM 4GB 이상 | veryfast | 23 | 30 |
+### ComfyUI 미연결 경고
+→ 정상 동작 — Java2D 씬으로 자동 폴백됨  
+→ AI 클립 원하면 ComfyUI 설치 후 실행
 
-### 병렬 파이프라인
-
-TTS 음성 생성과 썸네일 생성을 동시에 실행해서 전체 생성 시간을 단축합니다.
-
-```
-스크립트 생성 → [TTS 음성 생성 ∥ 썸네일 생성] → 영상 합성
-```
-
-### 주요 최적화 목록
-
-| 항목 | 내용 |
-|------|------|
-| 폰트 캐시 | JVM 기동 시 1회 탐색, static final 캐싱 |
-| 자막 프레임 캐시 | 동일 자막 청크 내 프레임 재사용 (~95% 렌더링 감소) |
-| TextLayout 외곽선 | 48번 drawString → 1번 draw(Shape) |
-| JPEG 품질 95 | 썸네일 기본값 75 → 95 명시 |
-| OS별 javacv | 전 플랫폼 1.5GB → 현재 OS만 ~300MB |
-| G1GC | 저사양 환경 GC pause 최소화 |
-| WAV 리샘플링 | Piper 22050Hz → 44100Hz 변환으로 노이즈 제거 |
-| 파티클 배경 | 80개 파티클 + 보색 강조 + 3단 그라데이션 |
-| 자막 타이밍 | 균등 분할 → 단어 수 비례 가중 타이밍 |
+### 스크립트 JSON 파싱 실패
+→ Ollama 모델이 JSON을 제대로 출력 안 할 때  
+→ 다시 시도하거나 `ollama pull gemma3` 재설치

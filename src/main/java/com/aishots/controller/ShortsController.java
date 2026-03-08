@@ -4,6 +4,7 @@ import com.aishots.dto.JobStatus;
 import com.aishots.dto.ScriptData;
 import com.aishots.dto.ShortsRequest;
 import com.aishots.exception.ShortsException;
+import com.aishots.service.AnimateDiffService;
 import com.aishots.service.ScriptService;
 import com.aishots.service.ShortsGenerationService;
 import com.aishots.util.PathUtils;
@@ -31,85 +32,59 @@ import java.util.UUID;
 public class ShortsController {
 
     private final ShortsGenerationService shortsGenerationService;
-    private final ScriptService scriptService;
+    private final ScriptService           scriptService;
+    private final AnimateDiffService      animateDiffService;
 
     @Value("${output.video.dir}")
     private String videoDir;
 
-    @Value("${output.thumbnail.dir}")
-    private String thumbnailDir;
-
-    // ── 페이지 ──────────────────────────────────────────────
+    // ── 페이지 ──────────────────────────────────────────────────
 
     @GetMapping("/")
-    public String index() {
-        return "index";
-    }
+    public String index() { return "index"; }
 
-    // ── API ─────────────────────────────────────────────────
+    // ── API ─────────────────────────────────────────────────────
 
-    /**
-     * 영상 생성 시작
-     *
-     * [보안] @Valid로 DTO 검증 → GlobalExceptionHandler가 400 응답 처리
-     * [보안] tone/voice 화이트리스트 검증 (프롬프트 인젝션 방지)
-     * [보안] jobId를 full UUID로 변경 (8자리 단축 시 충돌 및 추측 가능)
-     */
     @PostMapping("/api/shorts/generate")
     @ResponseBody
     public ResponseEntity<?> generate(@Valid @RequestBody ShortsRequest request) {
-        // tone / voice 화이트리스트 검증
-        if (!ShortsRequest.ALLOWED_TONES.contains(request.getTone())) {
+        if (!ShortsRequest.ALLOWED_TONES.contains(request.getTone()))
             throw new ShortsException("Invalid tone. Allowed: " + ShortsRequest.ALLOWED_TONES);
-        }
-        if (!ShortsRequest.ALLOWED_VOICES.contains(request.getVoice())) {
-            throw new ShortsException("허용되지 않는 음성입니다.");
-        }
+        if (!ShortsRequest.ALLOWED_VOICES.contains(request.getVoice()))
+            throw new ShortsException("Invalid voice.");
+        if (!ShortsRequest.ALLOWED_BGM_STYLES.contains(
+                request.getBgmStyle() != null ? request.getBgmStyle().toUpperCase() : "NONE"))
+            throw new ShortsException("Invalid BGM style. Allowed: " + ShortsRequest.ALLOWED_BGM_STYLES);
 
-        // [보안] full UUID 사용 — 8자리 단축은 brute-force 추측 가능
+        // bgmStyle 대문자 정규화
+        request.setBgmStyle(request.getBgmStyle() != null
+                ? request.getBgmStyle().toUpperCase() : "NONE");
+
         String jobId = UUID.randomUUID().toString();
         shortsGenerationService.initJob(jobId);
         shortsGenerationService.generateShorts(jobId, request);
 
-        return ResponseEntity.ok(Map.of("jobId", jobId, "message", "영상 생성이 시작되었습니다."));
+        return ResponseEntity.ok(Map.of("jobId", jobId, "message", "Video generation started."));
     }
 
-    /**
-     * 작업 상태 조회
-     *
-     * [보안] jobId PathUtils 검증으로 Path Traversal 방지
-     */
     @GetMapping("/api/shorts/status/{jobId}")
     @ResponseBody
     public ResponseEntity<?> getStatus(@PathVariable String jobId) {
-        PathUtils.validateId(jobId); // [보안] 형식 검증
+        PathUtils.validateId(jobId);
         JobStatus status = shortsGenerationService.getStatus(jobId);
         if (status == null) return ResponseEntity.notFound().build();
         return ResponseEntity.ok(status);
     }
 
-    /**
-     * 스크립트 미리보기
-     *
-     * [보안] topic 길이 제한 + 예외는 GlobalExceptionHandler 위임
-     *        → 내부 오류 메시지 클라이언트 노출 차단
-     */
     @GetMapping("/api/shorts/script/preview")
     @ResponseBody
     public ResponseEntity<?> previewScript(
             @RequestParam @jakarta.validation.constraints.Size(min = 2, max = 100) String topic,
-            @RequestParam(defaultValue = "60") @jakarta.validation.constraints.Min(30) @jakarta.validation.constraints.Max(90) int durationSeconds
-    ) {
-        ScriptData script = scriptService.generateScript(topic, durationSeconds, "친근하고 흥미롭게");
+            @RequestParam(defaultValue = "60") int durationSeconds) {
+        ScriptData script = scriptService.generateScript(topic, durationSeconds, "shocking and mind-blowing");
         return ResponseEntity.ok(Map.of("success", true, "data", script));
     }
 
-    /**
-     * 영상 다운로드
-     *
-     * [보안] jobId → PathUtils.validateId() → safeResolve()
-     *        baseDir 밖으로 절대 나갈 수 없도록 경계 검증
-     */
     @GetMapping("/api/shorts/download/video/{jobId}")
     public ResponseEntity<Resource> downloadVideo(@PathVariable String jobId) {
         PathUtils.validateId(jobId);
@@ -117,19 +92,18 @@ public class ShortsController {
         return serveFile(filePath.toFile(), jobId + ".mp4", "video/mp4");
     }
 
-    /**
-     * 썸네일 다운로드
-     *
-     * [보안] 동일한 Path Traversal 방어 적용
-     */
-    @GetMapping("/api/shorts/download/thumbnail/{jobId}")
-    public ResponseEntity<Resource> downloadThumbnail(@PathVariable String jobId) {
-        PathUtils.validateId(jobId);
-        Path filePath = PathUtils.safeResolve(Paths.get(thumbnailDir).toAbsolutePath(), jobId + ".jpg");
-        return serveFile(filePath.toFile(), jobId + ".jpg", "image/jpeg");
+    /** ComfyUI 연결 상태 확인 API */
+    @GetMapping("/api/comfyui/status")
+    @ResponseBody
+    public ResponseEntity<?> comfyStatus() {
+        boolean available = animateDiffService.isComfyAvailable();
+        return ResponseEntity.ok(Map.of(
+                "available", available,
+                "message", available ? "ComfyUI connected ✅" : "ComfyUI not running ❌"
+        ));
     }
 
-    // ── 내부 유틸 ────────────────────────────────────────────
+    // ── 내부 유틸 ────────────────────────────────────────────────
 
     private ResponseEntity<Resource> serveFile(File file, String downloadName, String mediaType) {
         if (!file.exists()) return ResponseEntity.notFound().build();

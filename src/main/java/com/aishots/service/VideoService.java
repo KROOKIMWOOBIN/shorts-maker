@@ -10,108 +10,63 @@ import org.springframework.stereotype.Service;
 
 import java.awt.*;
 import java.awt.font.TextLayout;
-import java.awt.geom.AffineTransform;
+import java.awt.geom.*;
 import java.awt.image.BufferedImage;
-import java.awt.image.DataBufferByte;
-import java.nio.file.Files;
-import java.nio.file.Paths;
+import java.nio.file.*;
 import java.util.*;
 import java.util.List;
-import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * 영상 합성 서비스 — 파티클 배경 + 자막 타이밍 + 오디오 노이즈 수정
+ * VideoService v5
  *
- * 변경 사항:
- * ① 파티클 애니메이션 배경 — 프레임마다 파티클 위치 업데이트
- * ② 자막 타이밍 수정 — 단어 수 기반 가중 타이밍 (균등 분할 제거)
- * ③ 오디오 노이즈 수정 — 44100Hz 통일, 오디오 먼저 삽입 후 비디오
- * ④ 자막 캐시 제거 — 파티클이 매 프레임 다르므로 캐시 불가
+ * 변경사항:
+ * ① ThumbnailService 의존성 완전 제거
+ * ② bgmPath 파라미터 추가 (BgmGeneratorService에서 생성된 WAV)
+ * ③ clipPaths 파라미터 추가 (AnimateDiff 클립 → 프레임 추출)
+ * ④ AI 클립 없으면 Java2D 씬으로 자동 폴백
  */
 @Slf4j
 @Service
 public class VideoService {
 
-    private static final int   WIDTH         = 1080;
-    private static final int   HEIGHT        = 1920;
-    private static final int   CHUNK_SIZE    = 4;
-    private static final float SUBTITLE_Y    = 0.78f;
-    private static final int   FONT_SIZE     = 72;
-    private static final float OUTLINE_WIDTH = 5f;
-    private static final int   SAMPLE_RATE   = 44100; // ③ 리샘플링과 통일
+    private static final int   W           = 1080;
+    private static final int   H           = 1920;
+    private static final int   SAMPLE_RATE = 44100;
+    private static final int   INTRO_SECS  = 3;
+    private static final int   OUTRO_SECS  = 3;
+    private static final int   FADE_FRAMES = 12;
+    private static final float SUBTITLE_Y  = 0.72f;
 
-    // 파티클 설정
-    private static final int   PARTICLE_COUNT      = 80;
-    private static final float PARTICLE_SPEED_MIN  = 0.3f;
-    private static final float PARTICLE_SPEED_MAX  = 1.2f;
-    private static final int   PARTICLE_SIZE_MIN   = 3;
-    private static final int   PARTICLE_SIZE_MAX   = 12;
+    private static final int    WORDS_PER_CHUNK = 3;
 
-    private static final Font CACHED_FONT = resolveKoreanFont(FONT_SIZE);
+    private static final Font FONT_WORD  = resolveFont(100, Font.BOLD);
+    private static final Font FONT_HOOK  = resolveFont(96,  Font.BOLD);
+    private static final Font FONT_CTA   = resolveFont(72,  Font.BOLD);
+    private static final Font FONT_LABEL = resolveFont(38,  Font.PLAIN);
 
-    private final TtsService     ttsService;
+    private final TtsService         ttsService;
     private final VideoRenderProfile profile;
 
     public VideoService(TtsService ttsService, VideoRenderProfile profile) {
         this.ttsService = ttsService;
         this.profile    = profile;
         avutil.av_log_set_level(avutil.AV_LOG_ERROR);
-        log.info("VideoService 준비 — 프로파일: {} / 폰트: {}",
-                profile.getProfile(), CACHED_FONT.getFontName());
+        log.info("VideoService v5 — 프로파일: {}", profile.getProfile());
     }
 
-    // ─────────────────────────────────────────────────────────────
-    //  파티클 데이터 클래스
-    // ─────────────────────────────────────────────────────────────
-
-    private static class Particle {
-        float x, y;        // 현재 위치
-        float vx, vy;      // 속도
-        int   size;        // 크기
-        float alpha;       // 투명도
-        float alphaDelta;  // 투명도 변화량 (반짝임)
-        Color color;       // 색상
-
-        Particle(Random rnd, int[] accentColor) {
-            x     = rnd.nextFloat() * WIDTH;
-            y     = rnd.nextFloat() * HEIGHT;
-            float speed = PARTICLE_SPEED_MIN + rnd.nextFloat() * (PARTICLE_SPEED_MAX - PARTICLE_SPEED_MIN);
-            float angle = rnd.nextFloat() * (float)(Math.PI * 2);
-            vx    = (float)(Math.cos(angle) * speed);
-            vy    = (float)(Math.sin(angle) * speed) - 0.4f; // 위로 살짝 편향
-            size  = PARTICLE_SIZE_MIN + rnd.nextInt(PARTICLE_SIZE_MAX - PARTICLE_SIZE_MIN);
-            alpha = 0.1f + rnd.nextFloat() * 0.5f;
-            alphaDelta = (rnd.nextBoolean() ? 1 : -1) * (0.002f + rnd.nextFloat() * 0.005f);
-            // 강조색 기반 + 흰색 혼합
-            if (rnd.nextFloat() < 0.6f) {
-                color = new Color(accentColor[0], accentColor[1], accentColor[2]);
-            } else {
-                color = Color.WHITE;
-            }
-        }
-
-        void update() {
-            x += vx;
-            y += vy;
-            alpha += alphaDelta;
-            // 경계 처리: 화면 밖으로 나가면 반대편에서 등장
-            if (x < 0)      x = WIDTH;
-            if (x > WIDTH)  x = 0;
-            if (y < 0)      y = HEIGHT;
-            if (y > HEIGHT) y = 0;
-            // 투명도 반전
-            if (alpha > 0.7f || alpha < 0.05f) alphaDelta = -alphaDelta;
-        }
-    }
-
-    // ─────────────────────────────────────────────────────────────
+    // ════════════════════════════════════════════════════════════
     //  PUBLIC
-    // ─────────────────────────────────────────────────────────────
+    // ════════════════════════════════════════════════════════════
 
     public String createShortsVideo(
-            String audioPath, String script, String hookText, String topic,
-            int bgR, int bgG, int bgB, String filename) throws Exception {
+            String audioPath,
+            String script,
+            String hookText,
+            String topic,
+            List<String> clipPaths,   // AI 생성 클립 (없으면 빈 리스트)
+            String bgmPath,           // 생성된 BGM WAV (없으면 null)
+            int bgR, int bgG, int bgB,
+            String filename) throws Exception {
 
         String videoDir = "outputs/videos";
         Files.createDirectories(Paths.get(videoDir));
@@ -121,34 +76,27 @@ public class VideoService {
         int    fps         = profile.getFps();
         long   totalFrames = (long)(duration * fps);
 
-        log.info("[{}] 시작 — {:.1f}s / {}프레임 / {}fps",
-                filename, duration, totalFrames, fps);
+        SceneType   scene   = SceneType.fromTopic(topic != null ? topic : script);
+        EmotionTone emotion = EmotionTone.fromText(script, script);
+        log.info("[{}] 씬={} 감정={} {}초 {}fps", filename, scene, emotion, (int)duration, fps);
 
-        // ② 단어 수 기반 가중 자막 타이밍
-        List<String> chunks      = buildSubtitleChunks(script);
-        double[]     chunkTimes  = buildChunkTimings(chunks, duration);
+        // AI 클립 → 프레임 추출
+        List<BufferedImage> clipFrames = extractFramesFromClips(clipPaths);
+        log.info("[{}] AI 클립 프레임: {}장", filename, clipFrames.size());
 
-        // 강조색 (배경색에서 보색 계산)
-        int[] accent = computeAccentColor(bgR, bgG, bgB);
-
-        // 파티클 초기화
-        Random   rnd       = new Random(42); // 시드 고정 → 재현 가능
-        Particle[] particles = new Particle[PARTICLE_COUNT];
-        for (int i = 0; i < PARTICLE_COUNT; i++)
-            particles[i] = new Particle(rnd, accent);
+        List<String> words     = buildWords(script);
+        double[]     wordTimes = buildWordTimings(words, duration);
+        Random       rnd       = new Random(42);
 
         FFmpegFrameRecorder recorder = buildRecorder(outputPath, fps);
         try {
             recorder.start();
-
-            // ③ 오디오 먼저 삽입 (타임스탬프 기준점 확립)
             injectAudio(recorder, audioPath);
-
-            // 비디오 렌더링
-            renderFrames(recorder, bgR, bgG, bgB, accent,
-                    particles, chunks, chunkTimes,
-                    totalFrames, fps, filename);
-
+            if (bgmPath != null) injectBgm(recorder, bgmPath, duration);
+            renderFrames(recorder, scene, emotion,
+                    hookText, words, wordTimes,
+                    totalFrames, fps, duration, rnd, filename,
+                    clipFrames);
         } finally {
             try { recorder.stop();    } catch (Exception e) { log.warn("stop: {}",    e.getMessage()); }
             try { recorder.release(); } catch (Exception e) { log.warn("release: {}", e.getMessage()); }
@@ -158,179 +106,386 @@ public class VideoService {
         return outputPath;
     }
 
-    // ─────────────────────────────────────────────────────────────
-    //  프레임 렌더링
-    // ─────────────────────────────────────────────────────────────
+    // ════════════════════════════════════════════════════════════
+    //  AI 클립 → 프레임 추출
+    // ════════════════════════════════════════════════════════════
+
+    private List<BufferedImage> extractFramesFromClips(List<String> clipPaths) {
+        List<BufferedImage> frames = new ArrayList<>();
+        if (clipPaths == null || clipPaths.isEmpty()) return frames;
+
+        Java2DFrameConverter converter = new Java2DFrameConverter();
+        for (String clipPath : clipPaths) {
+            if (!Files.exists(Paths.get(clipPath))) continue;
+            try (FFmpegFrameGrabber grabber = new FFmpegFrameGrabber(clipPath)) {
+                grabber.start();
+                Frame frame;
+                int count = 0;
+                while ((frame = grabber.grabImage()) != null && count < 32) {
+                    BufferedImage img = converter.convert(frame);
+                    if (img != null) {
+                        frames.add(deepCopy(img));
+                        count++;
+                    }
+                }
+                log.debug("클립 프레임 {}장 추출: {}", count, clipPath);
+            } catch (Exception e) {
+                log.warn("클립 프레임 추출 실패: {}", e.getMessage());
+            }
+        }
+        return frames;
+    }
+
+    private BufferedImage deepCopy(BufferedImage src) {
+        BufferedImage copy = new BufferedImage(src.getWidth(), src.getHeight(), BufferedImage.TYPE_3BYTE_BGR);
+        copy.createGraphics().drawImage(src, 0, 0, null);
+        return copy;
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  프레임 루프
+    // ════════════════════════════════════════════════════════════
 
     private void renderFrames(
             FFmpegFrameRecorder recorder,
-            int bgR, int bgG, int bgB, int[] accent,
-            Particle[] particles,
-            List<String> chunks, double[] chunkTimes,
-            long totalFrames, int fps, String jobId) throws Exception {
+            SceneType scene, EmotionTone emotion,
+            String hookText,
+            List<String> words, double[] wordTimes,
+            long totalFrames, int fps, double duration,
+            Random rnd, String jobId,
+            List<BufferedImage> clipFrames) throws Exception {
 
         Java2DFrameConverter converter = new Java2DFrameConverter();
-        BufferedImage buffer = new BufferedImage(WIDTH, HEIGHT, BufferedImage.TYPE_3BYTE_BGR);
-
+        BufferedImage buffer = new BufferedImage(W, H, BufferedImage.TYPE_3BYTE_BGR);
         long lastLog = 0;
 
-        for (long frameIdx = 0; frameIdx < totalFrames; frameIdx++) {
-            double currentTime = (double) frameIdx / fps;
-            String subtitle    = getSubtitleByTime(chunks, chunkTimes, currentTime);
+        for (long fi = 0; fi < totalFrames; fi++) {
+            double t = (double) fi / fps;
 
-            // 파티클 업데이트
-            for (Particle p : particles) p.update();
+            Graphics2D g = buffer.createGraphics();
+            applyHints(g);
 
-            // 프레임 렌더링
-            renderFrame(buffer, bgR, bgG, bgB, accent, particles, subtitle, frameIdx, fps);
+            // 1. 배경: AI 클립 or Java2D 씬
+            if (!clipFrames.isEmpty()) {
+                drawClipFrame(g, clipFrames, t, duration);
+            } else {
+                drawScene(g, scene, emotion, t, rnd);
+            }
 
-            recorder.setTimestamp((long)(currentTime * 1_000_000));
+            // 2. 진행 바
+            drawProgressBar(g, t, duration, emotion);
+
+            // 3. 콘텐츠
+            if (t < INTRO_SECS) {
+                drawHookIntro(g, hookText, emotion, t);
+            } else if (t > duration - OUTRO_SECS) {
+                drawCta(g, emotion, t, duration);
+            } else {
+                String word = getCurrentWord(words, wordTimes, t);
+                if (word != null && !word.isBlank())
+                    drawWordPopup(g, word, emotion, fi, fps);
+            }
+
+            // 4. 페이드
+            float fade = computeFade(fi, totalFrames);
+            if (fade < 1f) {
+                g.setColor(new Color(0, 0, 0, (int)((1f - fade) * 255)));
+                g.fillRect(0, 0, W, H);
+            }
+
+            g.dispose();
+            recorder.setTimestamp((long)(t * 1_000_000));
             recorder.record(converter.convert(buffer), avutil.AV_PIX_FMT_BGR24);
 
-            if (frameIdx - lastLog >= fps * 5L) {
-                log.debug("[{}] {}% ({}/{})", jobId,
-                        String.format("%.0f", (double) frameIdx / totalFrames * 100),
-                        frameIdx, totalFrames);
-                lastLog = frameIdx;
+            if (fi - lastLog >= fps * 5L) {
+                log.debug("[{}] {}%", jobId, String.format("%.0f", (double) fi / totalFrames * 100));
+                lastLog = fi;
             }
         }
     }
 
-    // ─────────────────────────────────────────────────────────────
-    //  단일 프레임 렌더링
-    // ─────────────────────────────────────────────────────────────
+    // ════════════════════════════════════════════════════════════
+    //  AI 클립 프레임 렌더링 (켄번스 효과 + 하단 그라데이션)
+    // ════════════════════════════════════════════════════════════
 
-    private void renderFrame(
-            BufferedImage buffer,
-            int bgR, int bgG, int bgB, int[] accent,
-            Particle[] particles,
-            String subtitle,
-            long frameIdx, int fps) {
+    private void drawClipFrame(Graphics2D g, List<BufferedImage> frames,
+                                double t, double duration) {
+        int    total   = frames.size();
+        double perFrame = duration / total;
+        int    idx     = Math.min((int)(t / perFrame), total - 1);
+        double localT  = (t % perFrame) / perFrame;
 
-        Graphics2D g = buffer.createGraphics();
-        g.setRenderingHint(RenderingHints.KEY_ANTIALIASING,      RenderingHints.VALUE_ANTIALIAS_ON);
-        g.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_GASP);
-        g.setRenderingHint(RenderingHints.KEY_RENDERING,         RenderingHints.VALUE_RENDER_SPEED);
+        // 켄번스: 짝수=줌인+우패닝, 홀수=줌아웃+좌패닝
+        double zoomS = (idx % 2 == 0) ? 1.00 : 1.10;
+        double zoomE = (idx % 2 == 0) ? 1.10 : 1.00;
+        double panS  = (idx % 2 == 0) ? 0.00 : -0.03;
+        double panE  = (idx % 2 == 0) ? -0.03 : 0.00;
 
-        // ── 1. 그라데이션 배경 ──────────────────────────────────
-        drawGradientBackground(g, bgR, bgG, bgB);
+        double ease = localT < 0.5
+                ? 2 * localT * localT
+                : 1 - Math.pow(-2 * localT + 2, 2) / 2;
 
-        // ── 2. 파티클 ───────────────────────────────────────────
-        drawParticles(g, particles);
+        double zoom = zoomS + (zoomE - zoomS) * ease;
+        double panX = panS  + (panE  - panS)  * ease;
 
-        // ── 3. 하단 자막 영역 반투명 바 ─────────────────────────
-        if (subtitle != null && !subtitle.isBlank()) {
-            drawSubtitleBar(g, accent);
-            drawSubtitle(g, subtitle);
+        drawImageKenBurns(g, frames.get(idx), zoom, panX);
+
+        // 크로스페이드 (마지막 15%)
+        if (localT > 0.85 && idx + 1 < total) {
+            float alpha = (float)((localT - 0.85) / 0.15);
+            Composite orig = g.getComposite();
+            g.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, alpha));
+            drawImageKenBurns(g, frames.get(idx + 1), 1.0, 0.0);
+            g.setComposite(orig);
         }
 
-        g.dispose();
+        // 하단 그라데이션 (자막 가독성)
+        g.setPaint(new GradientPaint(0, H * 0.50f, new Color(0, 0, 0, 0),
+                0, H, new Color(0, 0, 0, 210)));
+        g.fillRect(0, (int)(H * 0.50f), W, H);
     }
 
-    // ─────────────────────────────────────────────────────────────
-    //  배경 그라데이션
-    // ─────────────────────────────────────────────────────────────
-
-    private void drawGradientBackground(Graphics2D g, int r, int gr, int b) {
-        // 3단 그라데이션: 상단 밝음 → 중간 → 하단 어두움
-        Color top    = new Color(Math.min(r + 30, 255), Math.min(gr + 30, 255), Math.min(b + 30, 255));
-        Color mid    = new Color(r, gr, b);
-        Color bottom = new Color(Math.max(r - 50, 0), Math.max(gr - 50, 0), Math.max(b - 50, 0));
-
-        // 상단 → 중간
-        g.setPaint(new GradientPaint(0, 0, top, 0, HEIGHT / 2, mid));
-        g.fillRect(0, 0, WIDTH, HEIGHT / 2);
-
-        // 중간 → 하단
-        g.setPaint(new GradientPaint(0, HEIGHT / 2, mid, 0, HEIGHT, bottom));
-        g.fillRect(0, HEIGHT / 2, WIDTH, HEIGHT / 2);
+    private void drawImageKenBurns(Graphics2D g, BufferedImage img, double zoom, double panX) {
+        int srcW   = img.getWidth();
+        int srcH   = img.getHeight();
+        double scale = Math.max((double) W / srcW, (double) H / srcH) * zoom;
+        int scaledW  = (int)(srcW * scale);
+        int scaledH  = (int)(srcH * scale);
+        int drawX    = (int)((W - scaledW) / 2.0 + scaledW * panX);
+        int drawY    = (H - scaledH) / 2;
+        g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BICUBIC);
+        g.drawImage(img, drawX, drawY, scaledW, scaledH, null);
     }
 
-    // ─────────────────────────────────────────────────────────────
-    //  파티클 렌더링
-    // ─────────────────────────────────────────────────────────────
+    // ════════════════════════════════════════════════════════════
+    //  씬 라우터 (AI 클립 없을 때 폴백)
+    // ════════════════════════════════════════════════════════════
 
-    private void drawParticles(Graphics2D g, Particle[] particles) {
-        for (Particle p : particles) {
-            Color c = new Color(
-                    p.color.getRed(),
-                    p.color.getGreen(),
-                    p.color.getBlue(),
-                    (int)(p.alpha * 255)
-            );
-            g.setColor(c);
+    private void drawScene(Graphics2D g, SceneType scene, EmotionTone emotion,
+                            double t, Random rnd) {
+        switch (scene) {
+            case SPACE  -> SceneRenderer.drawSpace(g, t, rnd);
+            case CITY   -> SceneRenderer.drawCity(g, t);
+            case NATURE -> SceneRenderer.drawNature(g, t);
+            case OCEAN  -> SceneRenderer.drawOcean(g, t);
+            case FIRE   -> SceneRenderer.drawFire(g, t);
+            case TECH   -> SceneRenderer.drawTech(g, t);
+            case DARK   -> SceneRenderer.drawDark(g, t);
+            default     -> SceneRenderer.drawAbstract(g, t, emotion);
+        }
+    }
 
-            // 큰 파티클은 원, 작은 파티클은 점
-            if (p.size >= 8) {
-                // 글로우 효과 (2겹)
-                g.setColor(new Color(
-                        p.color.getRed(), p.color.getGreen(), p.color.getBlue(),
-                        (int)(p.alpha * 80)));
-                g.fillOval((int)p.x - p.size, (int)p.y - p.size,
-                        p.size * 2, p.size * 2);
-                // 중심
-                g.setColor(c);
-                g.fillOval((int)p.x - p.size / 2, (int)p.y - p.size / 2,
-                        p.size, p.size);
-            } else {
-                g.fillOval((int)p.x - p.size / 2, (int)p.y - p.size / 2,
-                        p.size, p.size);
+    // ════════════════════════════════════════════════════════════
+    //  후킹 인트로
+    // ════════════════════════════════════════════════════════════
+
+    private void drawHookIntro(Graphics2D g, String hookText, EmotionTone emotion, double t) {
+        Color acc = emotion.accent;
+        double slideProgress = Math.min(1.0, t / 0.4);
+        int blockX = (int)((1 - slideProgress) * -W);
+
+        g.setColor(new Color(0, 0, 0, 190));
+        g.fillRoundRect(blockX + 30, H / 2 - 350, W - 60, 580, 40, 40);
+
+        g.setColor(acc);
+        g.setStroke(new BasicStroke(5f));
+        g.drawLine(blockX + 70, H / 2 - 345, W - 70, H / 2 - 345);
+
+        String label = getLabelByEmotion(emotion);
+        g.setFont(FONT_LABEL);
+        FontMetrics lfm = g.getFontMetrics();
+        int lw = lfm.stringWidth(label) + 30;
+        g.setColor(new Color(acc.getRed(), acc.getGreen(), acc.getBlue(), 200));
+        g.fillRoundRect((W - lw) / 2, H / 2 - 310, lw, 44, 22, 22);
+        g.setColor(Color.BLACK);
+        g.drawString(label, (W - lfm.stringWidth(label)) / 2, H / 2 - 278);
+
+        if (hookText != null && t > 0.5) {
+            String display = hookText.substring(0,
+                    Math.min(hookText.length(), (int)((t - 0.5) / 0.05)));
+            if (!display.isBlank()) {
+                float scale = (float)Math.min(1.0, (t - 0.5) / 0.3 * 1.05);
+                AffineTransform orig = g.getTransform();
+                g.translate(W / 2.0, H / 2.0 - 80);
+                g.scale(Math.max(0.3f, scale), Math.max(0.3f, scale));
+                g.translate(-W / 2.0, -(H / 2.0 - 80));
+                drawTextShadowed(g, display, FONT_HOOK, Color.WHITE, acc, H / 2 - 80, W - 100);
+                g.setTransform(orig);
+            }
+            if ((int)(t * 2) % 2 == 0 && display.length() < hookText.length()) {
+                g.setColor(acc);
+                g.fillRect(W / 2, H / 2 - 120, 4, 96);
             }
         }
+
+        if (t > 1.8) {
+            float alpha = (float)(0.5 + 0.5 * Math.sin((t - 1.8) * Math.PI * 3));
+            g.setFont(FONT_LABEL);
+            g.setColor(new Color(255, 255, 255, (int)(alpha * 200)));
+            String hint = "▼  Keep watching  ▼";
+            FontMetrics hfm = g.getFontMetrics();
+            g.drawString(hint, (W - hfm.stringWidth(hint)) / 2, H / 2 + 260);
+        }
     }
 
-    // ─────────────────────────────────────────────────────────────
-    //  자막 바 + 자막
-    // ─────────────────────────────────────────────────────────────
+    private String getLabelByEmotion(EmotionTone e) {
+        return switch (e) {
+            case SHOCKING  -> "🔥 SHOCKING FACT";
+            case INSPIRING -> "⭐ INSPIRING";
+            case SCARY     -> "😱 YOU WON'T BELIEVE THIS";
+            case HAPPY     -> "✨ AMAZING FACT";
+            case SERIOUS   -> "⚠️ IMPORTANT";
+            default        -> "💡 DID YOU KNOW?";
+        };
+    }
 
-    private void drawSubtitleBar(Graphics2D g, int[] accent) {
-        int barHeight = 180;
-        int barY      = HEIGHT - barHeight - 60;
+    // ════════════════════════════════════════════════════════════
+    //  단어 팝업 자막
+    // ════════════════════════════════════════════════════════════
 
-        // 반투명 블러 바
-        g.setColor(new Color(0, 0, 0, 140));
-        g.fillRoundRect(40, barY - 20, WIDTH - 80, barHeight + 40, 30, 30);
+    private static final Color[] HIGHLIGHT_COLORS = {
+        new Color(255, 220, 0),    // 노랑
+        Color.WHITE,
+        new Color(0, 255, 200),    // 시안
+        Color.WHITE,
+        new Color(255, 120, 120),  // 분홍
+        Color.WHITE,
+    };
 
-        // 상단 강조선
-        g.setColor(new Color(accent[0], accent[1], accent[2], 200));
+    private void drawWordPopup(Graphics2D g, String word, EmotionTone emotion,
+                                long fi, int fps) {
+        Color  acc      = emotion.accent;
+        double localT   = (fi % Math.max(1, fps / 3.0)) / Math.max(1, fps / 3.0);
+        float  popScale = (float)(1.0 + Math.sin(localT * Math.PI) * 0.12);
+        int    centerY  = (int)(H * SUBTITLE_Y);
+        int    barH     = 260;
+        int    barY     = centerY - barH / 2;
+
+        g.setColor(new Color(0, 0, 0, 170));
+        g.fillRoundRect(25, barY, W - 50, barH, 35, 35);
+        g.setColor(new Color(acc.getRed(), acc.getGreen(), acc.getBlue(), 200));
+        g.setStroke(new BasicStroke(5f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+        g.drawLine(70, barY + 6, W - 70, barY + 6);
+        g.drawLine(70, barY + barH - 6, W - 70, barY + barH - 6);
+
+        AffineTransform orig = g.getTransform();
+        g.translate(W / 2.0, centerY);
+        g.scale(popScale, popScale);
+        g.translate(-W / 2.0, -centerY);
+
+        boolean isNumeric  = word.matches(".*\\d.*");
+        int     chunkIdx   = (int)(fi / Math.max(1, fps / 3.0));
+        Color   fillColor  = isNumeric
+                ? new Color(255, 220, 0)
+                : HIGHLIGHT_COLORS[chunkIdx % HIGHLIGHT_COLORS.length];
+        Color shadowColor  = isNumeric ? new Color(180, 100, 0) : acc;
+
+        drawTextShadowed(g, word.toUpperCase(), FONT_WORD, fillColor, shadowColor, centerY, W - 80);
+        g.setTransform(orig);
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  CTA 아웃트로
+    // ════════════════════════════════════════════════════════════
+
+    private void drawCta(Graphics2D g, EmotionTone emotion, double t, double duration) {
+        Color acc   = emotion.accent;
+        float alpha = (float)Math.min(1.0, (t - (duration - OUTRO_SECS)) / 0.5);
+
+        g.setColor(new Color(0, 0, 0, (int)(alpha * 200)));
+        g.fillRoundRect(30, H / 2 - 400, W - 60, 700, 50, 50);
+        g.setColor(new Color(acc.getRed(), acc.getGreen(), acc.getBlue(), (int)(alpha * 180)));
+        g.setStroke(new BasicStroke(4f));
+        g.drawRoundRect(30, H / 2 - 400, W - 60, 700, 50, 50);
+
+        AffineTransform orig = g.getTransform();
+        g.translate(0, (int)((1 - alpha) * 50));
+
+        drawCtaButton(g, "🔔  FOLLOW FOR MORE", acc, W / 2, H / 2 - 200, (int)(alpha * 255));
+        drawCtaButton(g, "❤️  LIKE IF YOU LEARNED",
+                new Color(255, 80, 80), W / 2, H / 2, (int)(alpha * 255));
+
+        g.setFont(FONT_LABEL);
+        g.setColor(new Color(200, 200, 200, (int)(alpha * 180)));
+        String tag = "Share this with someone who needs it!";
+        FontMetrics fm = g.getFontMetrics();
+        g.drawString(tag, (W - fm.stringWidth(tag)) / 2, H / 2 + 220);
+        g.setTransform(orig);
+    }
+
+    private void drawCtaButton(Graphics2D g, String text, Color c, int cx, int cy, int alpha) {
+        g.setFont(FONT_CTA);
+        FontMetrics fm = g.getFontMetrics();
+        int bw = fm.stringWidth(text) + 60;
+        int bh = 72 + 30;
+        g.setColor(new Color(c.getRed(), c.getGreen(), c.getBlue(), alpha / 3));
+        g.fillRoundRect(cx - bw / 2, cy - bh / 2, bw, bh, 30, 30);
+        g.setColor(new Color(c.getRed(), c.getGreen(), c.getBlue(), alpha));
         g.setStroke(new BasicStroke(3f));
-        g.drawLine(80, barY - 18, WIDTH - 80, barY - 18);
+        g.drawRoundRect(cx - bw / 2, cy - bh / 2, bw, bh, 30, 30);
+        g.setColor(new Color(255, 255, 255, alpha));
+        g.drawString(text, cx - fm.stringWidth(text) / 2, cy + 24);
     }
 
-    private void drawSubtitle(Graphics2D g, String text) {
-        g.setFont(CACHED_FONT);
-        FontMetrics  fm    = g.getFontMetrics();
-        List<String> lines = wrapText(fm, text, WIDTH - 160);
-        int lh     = FONT_SIZE + 16;
-        int baseY  = HEIGHT - 120 - (lines.size() * lh) / 2;
+    // ════════════════════════════════════════════════════════════
+    //  진행 바
+    // ════════════════════════════════════════════════════════════
 
-        Stroke outlineStroke = new BasicStroke(OUTLINE_WIDTH,
-                BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND);
-        Stroke prev = g.getStroke();
+    private void drawProgressBar(Graphics2D g, double t, double duration, EmotionTone emotion) {
+        int barH = 6, barY = H - barH - 20;
+        Color acc = emotion.accent;
+        g.setColor(new Color(255, 255, 255, 30));
+        g.fillRoundRect(0, barY, W, barH, barH, barH);
+        int pw = (int)(W * Math.min(1.0, t / duration));
+        if (pw > 0) {
+            g.setPaint(new GradientPaint(0, 0,
+                    new Color(acc.getRed(), acc.getGreen(), acc.getBlue(), 200),
+                    pw, 0, new Color(255, 255, 255, 220)));
+            g.fillRoundRect(0, barY, pw, barH, barH, barH);
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  텍스트 렌더링
+    // ════════════════════════════════════════════════════════════
+
+    private void drawTextShadowed(Graphics2D g, String text, Font font,
+                                   Color fill, Color shadow, int centerY, int maxWidth) {
+        FontMetrics  fm    = g.getFontMetrics(font);
+        List<String> lines = wrapText(fm, text, maxWidth);
+        int lh     = font.getSize() + 18;
+        int startY = centerY - (lines.size() * lh) / 2;
+
+        Stroke outStroke  = new BasicStroke(8f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND);
+        Stroke thinStroke = new BasicStroke(2f);
+        Stroke prev       = g.getStroke();
 
         for (int i = 0; i < lines.size(); i++) {
             String line = lines.get(i);
-            int    x    = (WIDTH - fm.stringWidth(line)) / 2;
-            int    y    = baseY + (i + 1) * lh;
+            if (line.isBlank()) continue;
+            int x = (W - fm.stringWidth(line)) / 2;
+            int y = startY + (i + 1) * lh;
 
-            TextLayout layout  = new TextLayout(line, CACHED_FONT, g.getFontRenderContext());
+            TextLayout layout  = new TextLayout(line, font, g.getFontRenderContext());
             Shape      outline = layout.getOutline(AffineTransform.getTranslateInstance(x, y));
 
-            // 외곽선
+            g.setColor(new Color(0, 0, 0, 180));
+            g.fill(layout.getOutline(AffineTransform.getTranslateInstance(x + 5, y + 5)));
             g.setColor(new Color(0, 0, 0, 230));
-            g.setStroke(outlineStroke);
+            g.setStroke(outStroke);
             g.draw(outline);
-
-            // 본문
+            g.setColor(new Color(shadow.getRed(), shadow.getGreen(), shadow.getBlue(), 160));
+            g.setStroke(thinStroke);
+            g.draw(layout.getOutline(AffineTransform.getTranslateInstance(x + 1, y + 1)));
             g.setStroke(prev);
-            g.setColor(Color.WHITE);
+            g.setColor(fill);
             g.fill(outline);
         }
     }
 
-    // ─────────────────────────────────────────────────────────────
-    //  오디오 삽입 — 순차 삽입 (노이즈 방지)
-    // ─────────────────────────────────────────────────────────────
+    // ════════════════════════════════════════════════════════════
+    //  오디오
+    // ════════════════════════════════════════════════════════════
 
     private void injectAudio(FFmpegFrameRecorder recorder, String audioPath) {
         try (FFmpegFrameGrabber grabber = new FFmpegFrameGrabber(audioPath)) {
@@ -338,74 +493,43 @@ public class VideoService {
             grabber.setSampleRate(SAMPLE_RATE);
             grabber.start();
             Frame f;
-            while ((f = grabber.grabSamples()) != null) {
+            while ((f = grabber.grabSamples()) != null) recorder.record(f);
+        } catch (Exception e) { log.warn("오디오 삽입 오류: {}", e.getMessage()); }
+    }
+
+    private void injectBgm(FFmpegFrameRecorder recorder, String bgmPath, double duration) {
+        try (FFmpegFrameGrabber grabber = new FFmpegFrameGrabber(bgmPath)) {
+            grabber.setAudioChannels(2);
+            grabber.setSampleRate(SAMPLE_RATE);
+            grabber.start();
+            Frame  f;
+            double played = 0;
+            while (played < duration && (f = grabber.grabSamples()) != null) {
+                if (f.samples != null) {
+                    for (java.nio.Buffer buf : f.samples) {
+                        if (buf instanceof java.nio.ShortBuffer sb) {
+                            sb.rewind();
+                            while (sb.hasRemaining()) {
+                                int pos = sb.position();
+                                sb.put(pos, (short)(sb.get(pos) * 0.22f)); // 22% 볼륨
+                                sb.position(pos + 1);
+                            }
+                            sb.rewind();
+                        }
+                    }
+                }
                 recorder.record(f);
+                played += f.samples != null ? (double) f.samples[0].limit() / SAMPLE_RATE : 0;
             }
-            log.debug("오디오 삽입 완료");
-        } catch (Exception e) {
-            log.warn("오디오 삽입 오류: {}", e.getMessage());
-        }
+        } catch (Exception e) { log.warn("BGM 삽입 오류: {}", e.getMessage()); }
     }
 
-    // ─────────────────────────────────────────────────────────────
-    //  ② 자막 타이밍 — 단어 수 기반 가중치
-    // ─────────────────────────────────────────────────────────────
-
-    /**
-     * 각 청크의 단어 수에 비례해서 시간을 배분합니다.
-     * 기존 균등 분할 대비 실제 발화 속도에 가까운 타이밍.
-     *
-     * 예) 청크A 2단어, 청크B 4단어 → A는 1/3, B는 2/3 시간 배분
-     */
-    private double[] buildChunkTimings(List<String> chunks, double totalDuration) {
-        if (chunks.isEmpty()) return new double[0];
-
-        int[] wordCounts = chunks.stream()
-                .mapToInt(c -> c.split("\\s+").length)
-                .toArray();
-        int totalWords = Arrays.stream(wordCounts).sum();
-
-        double[] timings = new double[chunks.size() + 1]; // [시작시간, ..., 종료시간]
-        timings[0] = 0.0;
-        for (int i = 0; i < chunks.size(); i++) {
-            double weight = totalWords > 0
-                    ? (double) wordCounts[i] / totalWords
-                    : 1.0 / chunks.size();
-            timings[i + 1] = timings[i] + totalDuration * weight;
-        }
-        return timings;
-    }
-
-    private String getSubtitleByTime(List<String> chunks, double[] timings, double currentTime) {
-        if (chunks.isEmpty() || timings.length == 0) return "";
-        for (int i = 0; i < chunks.size(); i++) {
-            if (currentTime >= timings[i] && currentTime < timings[i + 1]) {
-                return chunks.get(i);
-            }
-        }
-        return chunks.get(chunks.size() - 1); // 마지막 청크 유지
-    }
-
-    // ─────────────────────────────────────────────────────────────
-    //  보색 계산 (배경색 기반 파티클 강조색)
-    // ─────────────────────────────────────────────────────────────
-
-    private int[] computeAccentColor(int r, int g, int b) {
-        // HSB 변환 후 색조 180도 회전 (보색)
-        float[] hsb = Color.RGBtoHSB(r, g, b, null);
-        hsb[0] = (hsb[0] + 0.5f) % 1.0f; // 보색
-        hsb[1] = Math.max(hsb[1], 0.6f);  // 채도 최소 60%
-        hsb[2] = Math.max(hsb[2], 0.8f);  // 밝기 최소 80%
-        Color accent = Color.getHSBColor(hsb[0], hsb[1], hsb[2]);
-        return new int[]{accent.getRed(), accent.getGreen(), accent.getBlue()};
-    }
-
-    // ─────────────────────────────────────────────────────────────
+    // ════════════════════════════════════════════════════════════
     //  FFmpeg 레코더
-    // ─────────────────────────────────────────────────────────────
+    // ════════════════════════════════════════════════════════════
 
     private FFmpegFrameRecorder buildRecorder(String outputPath, int fps) {
-        FFmpegFrameRecorder r = new FFmpegFrameRecorder(outputPath, WIDTH, HEIGHT, 0);
+        FFmpegFrameRecorder r = new FFmpegFrameRecorder(outputPath, W, H, 0);
         r.setVideoCodec(avcodec.AV_CODEC_ID_H264);
         r.setFormat("mp4");
         r.setFrameRate(fps);
@@ -416,24 +540,65 @@ public class VideoService {
         r.setVideoOption("threads",  String.valueOf(profile.getThreads()));
         r.setVideoOption("movflags", "+faststart");
         r.setAudioCodec(avcodec.AV_CODEC_ID_AAC);
-        r.setAudioChannels(1);
-        r.setSampleRate(SAMPLE_RATE); // ③ 44100Hz 통일
-        r.setAudioBitrate(128000);
+        r.setAudioChannels(2);
+        r.setSampleRate(SAMPLE_RATE);
+        r.setAudioBitrate(192000);
         return r;
     }
 
-    // ─────────────────────────────────────────────────────────────
-    //  유틸
-    // ─────────────────────────────────────────────────────────────
+    // ════════════════════════════════════════════════════════════
+    //  자막 타이밍
+    // ════════════════════════════════════════════════════════════
 
-    private List<String> buildSubtitleChunks(String script) {
+    private List<String> buildWords(String script) {
         if (script == null || script.isBlank()) return List.of();
-        String[] words = script.split("\\s+");
+        String[] raw    = script.trim().split("\\s+");
         List<String> chunks = new ArrayList<>();
-        for (int i = 0; i < words.length; i += CHUNK_SIZE)
-            chunks.add(String.join(" ",
-                    Arrays.copyOfRange(words, i, Math.min(i + CHUNK_SIZE, words.length))));
+        for (int i = 0; i < raw.length; i += WORDS_PER_CHUNK) {
+            String chunk = String.join(" ",
+                    Arrays.copyOfRange(raw, i, Math.min(i + WORDS_PER_CHUNK, raw.length)));
+            chunks.add(chunk);
+        }
         return chunks;
+    }
+
+    private double[] buildWordTimings(List<String> words, double duration) {
+        if (words.isEmpty()) return new double[0];
+        double available = Math.max(duration - INTRO_SECS - OUTRO_SECS, 1.0);
+        int    totalChars = words.stream().mapToInt(String::length).sum();
+        double[] times   = new double[words.size() + 1];
+        times[0] = INTRO_SECS;
+        for (int i = 0; i < words.size(); i++) {
+            double w = totalChars > 0
+                    ? (double) words.get(i).length() / totalChars
+                    : 1.0 / words.size();
+            times[i + 1] = times[i] + available * w;
+        }
+        return times;
+    }
+
+    private String getCurrentWord(List<String> words, double[] times, double t) {
+        if (words.isEmpty() || times.length == 0) return "";
+        for (int i = 0; i < words.size(); i++)
+            if (t >= times[i] && t < times[i + 1]) return words.get(i);
+        return words.get(words.size() - 1);
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  유틸
+    // ════════════════════════════════════════════════════════════
+
+    private float computeFade(long fi, long totalFrames) {
+        if (fi < FADE_FRAMES) return (float) fi / FADE_FRAMES;
+        if (fi > totalFrames - FADE_FRAMES) return (float)(totalFrames - fi) / FADE_FRAMES;
+        return 1f;
+    }
+
+    private void applyHints(Graphics2D g) {
+        g.setRenderingHint(RenderingHints.KEY_ANTIALIASING,      RenderingHints.VALUE_ANTIALIAS_ON);
+        g.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_GASP);
+        g.setRenderingHint(RenderingHints.KEY_RENDERING,         RenderingHints.VALUE_RENDER_SPEED);
+        g.setRenderingHint(RenderingHints.KEY_INTERPOLATION,     RenderingHints.VALUE_INTERPOLATION_BILINEAR);
     }
 
     private List<String> wrapText(FontMetrics fm, String text, int maxWidth) {
@@ -448,13 +613,13 @@ public class VideoService {
         return lines;
     }
 
-    private static Font resolveKoreanFont(int size) {
+    private static Font resolveFont(int size, int style) {
         for (String n : new String[]{
-                "Noto Sans KR", "NanumGothic", "NanumBarunGothic",
-                "맑은 고딕", "Apple SD Gothic Neo"}) {
-            Font f = new Font(n, Font.BOLD, size);
-            if (f.canDisplay('가')) return f;
+                "Noto Sans KR", "NanumGothic", "맑은 고딕",
+                "Arial Black", "Impact", Font.SANS_SERIF}) {
+            Font f = new Font(n, style, size);
+            if (f.canDisplay('A')) return f;
         }
-        return new Font(Font.SANS_SERIF, Font.BOLD, size);
+        return new Font(Font.SANS_SERIF, style, size);
     }
 }
