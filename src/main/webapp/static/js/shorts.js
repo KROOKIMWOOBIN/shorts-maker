@@ -3,26 +3,41 @@ let selectedColor = [15, 15, 35];
 let selectedBgm   = 'UPBEAT';
 let pollingInterval = null;
 
-// ── 색상 선택 ──────────────────────────────────────────────────
+// ── 색상 / BGM ─────────────────────────────────────────────────
 function selectColor(el) {
   document.querySelectorAll('.color-preset').forEach(e => e.classList.remove('active'));
   el.classList.add('active');
   selectedColor = JSON.parse(el.dataset.color);
 }
-
-// ── BGM 스타일 선택 ────────────────────────────────────────────
 function selectBgm(el) {
   document.querySelectorAll('.bgm-option').forEach(e => e.classList.remove('active'));
   el.classList.add('active');
   selectedBgm = el.dataset.bgm;
 }
 
-// ── 에러 표시 ──────────────────────────────────────────────────
+// ── 에러 ───────────────────────────────────────────────────────
 function showError(msg) {
   const b = document.getElementById('error-box');
   b.textContent = msg;
   b.style.display = 'block';
   setTimeout(() => b.style.display = 'none', 7000);
+}
+
+// ── 스크립트 렌더링 (한국어 + 영어 동시) ──────────────────────
+function renderScript(d, prefix) {
+  // 한국어
+  document.getElementById(prefix + 'title-ko').textContent  = d.title  || '';
+  document.getElementById(prefix + 'hook-ko').textContent   = d.hook   ? `"${d.hook}"` : '';
+  document.getElementById(prefix + 'script-ko').textContent = d.script || '';
+  document.getElementById(prefix + 'tags-ko').innerHTML = (d.hashtags || [])
+      .map(t => `<span class="hashtag">${t}</span>`).join('');
+
+  // 영어 — Ollama가 생성한 영어 버전
+  document.getElementById(prefix + 'title-en').textContent  = d.titleEn  || d.title  || '';
+  document.getElementById(prefix + 'hook-en').textContent   = d.hookEn   ? `"${d.hookEn}"`   : (d.hook ? `"${d.hook}"` : '');
+  document.getElementById(prefix + 'script-en').textContent = d.scriptEn || d.script || '';
+  document.getElementById(prefix + 'tags-en').innerHTML = ((d.hashtagsEn && d.hashtagsEn.length > 0) ? d.hashtagsEn : (d.hashtags || []))
+      .map(t => `<span class="hashtag">${t}</span>`).join('');
 }
 
 // ── 스크립트 미리보기 ──────────────────────────────────────────
@@ -36,17 +51,14 @@ async function previewScript() {
   document.getElementById('preview-section').style.display = 'none';
 
   try {
-    const res  = await fetch(`${API}/script/preview?topic=${encodeURIComponent(topic)}&durationSeconds=${document.getElementById('duration').value}`);
+    const duration = document.getElementById('duration').value;
+    const res  = await fetch(`${API}/script/preview?topic=${encodeURIComponent(topic)}&durationSeconds=${duration}`);
     const data = await res.json();
     if (!data.success) throw new Error(data.message);
 
-    const d = data.data;
-    document.getElementById('prev-title').textContent  = d.title  || '';
-    document.getElementById('prev-hook').textContent   = d.hook   ? `"${d.hook}"` : '';
-    document.getElementById('prev-script').textContent = d.script || '';
-    document.getElementById('prev-tags').innerHTML = (d.hashtags || [])
-        .map(t => `<span class="hashtag">${t}</span>`).join('');
+    renderScript(data.data, 'prev-');
     document.getElementById('preview-section').style.display = 'block';
+    document.getElementById('preview-section').scrollIntoView({ behavior: 'smooth' });
 
   } catch (e) {
     showError('스크립트 생성 실패: ' + e.message);
@@ -111,7 +123,6 @@ async function pollStatus(jobId) {
     if (data.status === 'COMPLETED') {
       clearInterval(pollingInterval);
       showResult(data, jobId);
-
     } else if (data.status === 'ERROR') {
       clearInterval(pollingInterval);
       showError(data.message || '생성 실패');
@@ -126,30 +137,19 @@ async function pollStatus(jobId) {
   }
 }
 
-// ── 결과 표시 (썸네일 없음) ────────────────────────────────────
+// ── 결과 표시 ─────────────────────────────────────────────────
 function showResult(data, jobId) {
   document.getElementById('progress-section').style.display = 'none';
   document.getElementById('result-section').style.display   = 'block';
 
-  // 영상
   const video = document.getElementById('result-video');
-  video.src = data.videoUrl + '?t=' + Date.now(); // 캐시 방지
+  video.src = data.videoUrl + '?t=' + Date.now();
   video.load();
 
-  // 다운로드 링크
   document.getElementById('dl-video').href = `${API}/download/video/${jobId}`;
 
-  // 스크립트
-  if (data.script) {
-    const d = data.script;
-    document.getElementById('res-title').textContent  = d.title  || '';
-    document.getElementById('res-hook').textContent   = d.hook   ? `"${d.hook}"` : '';
-    document.getElementById('res-script').textContent = d.script || '';
-    document.getElementById('res-tags').innerHTML = (d.hashtags || [])
-        .map(t => `<span class="hashtag">${t}</span>`).join('');
-  }
+  if (data.script) renderScript(data.script, 'res-');
 
-  // 버튼 복원
   const btn = document.getElementById('btn-gen');
   btn.innerHTML = '✦ AI 쇼츠 영상 생성하기';
   btn.disabled = false;

@@ -34,45 +34,52 @@ public class ScriptService {
 
     // ── 스크립트 + 이미지 프롬프트 동시 생성 ──────────────────
 
+    private static final int IMAGE_COUNT = 10;
+
     public ScriptData generateScript(String topic, int durationSeconds, String tone) {
+        durationSeconds   = Math.min(durationSeconds, 60);
         int wordCount     = durationSeconds * 2;
-        // 문장 수 = 대략 초 / 5 (한 문장당 약 5초)
-        int sentenceCount = Math.max(4, Math.min(10, durationSeconds / 5));
+        int sentenceCount = Math.max(4, Math.min(12, durationSeconds / 5));
+        int imageCount    = IMAGE_COUNT;
 
         String prompt = String.format("""
-                You are a world-class YouTube Shorts script writer.
+                당신은 세계 최고의 유튜브 쇼츠 스크립트 작가입니다.
 
-                Write a %d-second YouTube Shorts script on:
-                Topic: %s
-                Tone: %s
-                Target word count: ~%d words
-                Number of sentences: exactly %d sentences
+                다음 주제로 %d초짜리 유튜브 쇼츠 스크립트를 한국어로 작성하세요:
+                주제: %s
+                톤: %s
+                목표 단어 수: 약 %d 단어
+                문장 수: 정확히 %d개
 
-                RULES:
-                - Hook must be shocking, surprising, or deeply curiosity-inducing
-                - Script must feel like a real person talking, not an essay
-                - Every sentence must make the viewer want to hear the next one
-                - End with a cliffhanger or revelation
-                - Include at least one surprising statistic or fact with a number
-                - script field must be ONE plain string (all sentences joined)
-                - sentences field must be an array of exactly %d strings (split the script into sentences)
-                - imagePrompts field must be an array of exactly %d strings
-                  Each imagePrompt: vivid, cinematic Stable Diffusion prompt for that sentence
-                  Format: "subject, scene details, lighting, style, 4k, photorealistic"
-                  Must visually match the sentence content
-                - IMPORTANT: script field must be a plain STRING, not an array
+                규칙:
+                - 훅은 충격적이고 강렬한 호기심을 유발해야 함
+                - 실제 사람이 말하는 것처럼 자연스럽게
+                - 매 문장이 다음 문장을 듣고 싶게 만들어야 함
+                - 마지막은 반전이나 클리프행어로 끝내기
+                - 숫자가 포함된 놀라운 통계나 사실 최소 1개 포함
+                - script 필드는 반드시 하나의 평문 문자열 (배열 금지)
+                - sentences 필드는 정확히 %d개의 문장 배열
+                - imagePrompts 필드는 정확히 %d개의 영어 Stable Diffusion 프롬프트 배열
+                  형식: "subject, scene details, lighting, style, 4k, photorealistic"
+                  전체 내러티브에 걸쳐 시각적으로 다양하게 분배
+                  각 이미지는 시각적으로 완전히 달라야 함 (씬 반복 금지)
+                  imagePrompts는 반드시 영어로 작성
 
-                Respond ONLY with this exact JSON (no markdown, no extra text):
+                반드시 아래 JSON만 응답 (마크다운, 추가 텍스트 금지):
                 {
-                    "title": "Clickbait title under 60 chars",
-                    "hook": "First 1-2 sentences that GRAB attention immediately",
-                    "script": "Full narration as ONE plain string.",
-                    "sentences": ["sentence 1", "sentence 2", ...],
-                    "emotion": "one of: SHOCKING, INSPIRING, SCARY, HAPPY, SERIOUS, NEUTRAL",
-                    "hashtags": ["#tag1", "#tag2", "#tag3", "#tag4", "#tag5"],
-                    "imagePrompts": ["SD prompt for sentence 1", "SD prompt for sentence 2", ...]
+                    "title": "60자 이내 클릭베이트 제목 (한국어)",
+                    "hook": "즉시 주목을 끄는 첫 1~2문장 (한국어)",
+                    "script": "전체 나레이션을 하나의 평문 문자열로 (한국어)",
+                    "sentences": ["문장1", "문장2", ...],
+                    "emotion": "SHOCKING, INSPIRING, SCARY, HAPPY, SERIOUS, NEUTRAL 중 하나",
+                    "hashtags": ["#태그1", "#태그2", "#태그3", "#태그4", "#태그5"],
+                    "titleEn": "Same title translated to English",
+                    "hookEn": "Same hook translated to English",
+                    "scriptEn": "Full narration translated to English as ONE plain string",
+                    "hashtagsEn": ["#tag1", "#tag2", "#tag3", "#tag4", "#tag5"],
+                    "imagePrompts": ["SD prompt 1 in English", "SD prompt 2 in English", ...]
                 }
-                """, durationSeconds, topic, tone, wordCount, sentenceCount, sentenceCount, sentenceCount);
+                """, durationSeconds, topic, tone, wordCount, sentenceCount, sentenceCount, imageCount);
 
         String rawResponse = callOllama(prompt);
         ScriptData data = parseScript(rawResponse);

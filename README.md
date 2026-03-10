@@ -82,6 +82,9 @@ git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite
 # ComfyUI/models/animatediff_models/ → mm_sd_v15_v2.ckpt
 #   다운로드: https://huggingface.co/guoyww/animatediff
 
+# 가상환경
+venv\Scripts\activate
+
 # 실행 (항상 백그라운드로)
 python main.py --listen 0.0.0.0 --port 8188
 ```

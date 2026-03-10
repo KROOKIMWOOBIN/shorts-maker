@@ -97,7 +97,7 @@ public class ShortsGenerationService {
             }
             if (imagePaths.isEmpty()) {
                 log.info("[{}] SD 이미지 없음 — Java2D 씬 폴백", jobId);
-                updateStatus(jobId, 55, "🎨 Rendering scenes (Java2D fallback)...");
+                
             } else {
                 log.info("[{}] SD 이미지 {}장 생성 완료", jobId, imagePaths.size());
             }
@@ -110,7 +110,7 @@ public class ShortsGenerationService {
                     script.getScript(),
                     script.getHook(),
                     request.getTopic(),
-                    imagePaths,   // SD 이미지 경로 (없으면 빈 리스트 → 폴백)
+                    imagePaths,
                     bgmPath,
                     bg.get(0), bg.get(1), bg.get(2),
                     jobId);

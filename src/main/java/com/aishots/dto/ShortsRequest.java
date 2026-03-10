@@ -28,7 +28,7 @@ public class ShortsRequest {
     private String topic;
 
     @Min(value = 30, message = "Minimum duration is 30 seconds.")
-    @Max(value = 90, message = "Maximum duration is 90 seconds.")
+    @Max(value = 60, message = "Maximum duration is 60 seconds.")
     private int durationSeconds = 60;
 
     @NotBlank(message = "Tone is required.")
