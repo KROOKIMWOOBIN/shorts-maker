@@ -62,7 +62,9 @@ public class ShortsGenerationService {
 
             CompletableFuture<String> ttsFuture = CompletableFuture.supplyAsync(() -> {
                 try {
-                    return ttsService.generateAudio(script.getScript(), jobId, request.getVoice());
+                    String ttsText = (script.getScriptEn() != null && !script.getScriptEn().isBlank())
+                            ? script.getScriptEn() : script.getScript();
+                    return ttsService.generateAudio(ttsText, jobId, request.getVoice());
                 } catch (Exception e) { throw new CompletionException(e); }
             }, parallelExecutor);
 
